@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Walls &amp; Floor Generation</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<header>
+  <div class="logo"><span>ZORY</span> · Walls &amp; Floor</div>
+  <div class="sep"></div>
+  <div class="subtitle">Draw floor plan → click wall or floor → drag products → generate</div>
+  <div class="spacer"></div>
+  <div id="status-bar">Ready</div>
+</header>
+
+<div class="workspace">
+
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <button class="tool-btn active" id="tool-draw" title="Draw walls (pencil)">✏️</button>
+    <button class="tool-btn" id="tool-select" title="Select / pan">↖️</button>
+    <div class="toolbar-sep"></div>
+    <button class="tool-btn" id="tool-undo" title="Undo last point">↩️</button>
+    <button class="tool-btn" id="tool-clear" title="Clear floor plan">🗑️</button>
+    <div class="toolbar-sep"></div>
+    <button class="tool-btn" id="tool-close" title="Close polygon (finish room)">⬡</button>
+  </div>
+
+  <!-- Canvas area -->
+  <div class="canvas-area">
+
+    <!-- Canvas 1: Floor plan drawing -->
+    <div class="canvas-panel" id="canvas1-wrap">
+      <div class="canvas-panel-header">
+        <span class="badge">1</span>
+        Floor Plan
+        <span class="info-tag" id="c1-hint">Click to draw walls · Double-click to close room</span>
+      </div>
+      <canvas id="canvas1"></canvas>
+      <div class="canvas-placeholder" id="c1-placeholder">
+        <div class="icon">🏠</div>
+        <div>Click to place first corner, then keep clicking to draw walls</div>
+        <div style="font-size:11px">Double-click or press ⬡ to close the room</div>
+      </div>
+    </div>
+
+    <!-- Canvas 2: Surface editor -->
+    <div class="canvas-panel" id="canvas2-wrap">
+      <div class="canvas-panel-header">
+        <span class="badge">2</span>
+        Surface Editor
+        <span class="info-tag" id="c2-label">Select a wall or floor in Canvas 1</span>
+      </div>
+      <canvas id="canvas2"></canvas>
+      <div class="canvas-placeholder" id="c2-placeholder">
+        <div class="icon">🖼️</div>
+        <div>Click a wall segment or the floor area above</div>
+        <div style="font-size:11px">Then drag products from the sidebar onto this surface</div>
+      </div>
+    </div>
+
+  </div><!-- /canvas-area -->
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+
+    <!-- Surface info -->
+    <div class="sidebar-section">
+      <div class="sidebar-section-title">Selected Surface</div>
+      <div id="surface-info">
+        <div class="no-selection" id="no-selection-msg">No surface selected</div>
+        <div id="surface-details" style="display:none">
+          <div class="info-row"><span class="label">Type</span><span class="val" id="info-type">—</span></div>
+          <div class="info-row"><span class="label">Width</span><span class="val" id="info-width">—</span></div>
+          <div class="info-row"><span class="label">Height</span><span class="val" id="info-height">—</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Placed products -->
+    <div class="sidebar-section">
+      <div class="sidebar-section-title">Placed Products</div>
+      <div id="placed-list">
+        <div id="no-placed-msg" style="font-size:12px;color:var(--text-muted);font-style:italic;padding:4px 6px">
+          Drag products onto the surface
+        </div>
+      </div>
+    </div>
+
+    <!-- Generate button -->
+    <div class="sidebar-section gen-section">
+      <button id="btn-generate" disabled>
+        <span>⚡</span> Generate
+      </button>
+    </div>
+
+    <!-- Result image -->
+    <div class="sidebar-section" id="result-section" style="display:none">
+      <div class="sidebar-section-title">Result</div>
+      <div id="result-img-wrap">
+        <img id="result-img" alt="Generated result" />
+        <a id="result-download" style="display:none;font-size:11px;color:var(--accent);padding:4px 0;display:block;text-align:center">
+          ⬇ Download
+        </a>
+      </div>
+    </div>
+
+    <!-- Product catalog -->
+    <div class="sidebar-section-title" style="padding-top:10px">Products</div>
+    <div class="catalog-list" id="catalog-list">
+      <div style="font-size:12px;color:var(--text-muted);padding:8px">Loading products…</div>
+    </div>
+
+  </div><!-- /sidebar -->
+
+</div><!-- /workspace -->
+
+<script src="/static/app.js"></script>
+</body>
+</html>

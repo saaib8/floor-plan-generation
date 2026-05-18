@@ -1,0 +1,92 @@
+[
+  {
+    "id": 1,
+    "name": "3-Seat Sofa",
+    "category": "seating",
+    "icon": "/products/icons/sofa.svg",
+    "image_url": "/products/icons/sofa.svg",
+    "dims": "2.2 x 0.9",
+    "dimensions": { "width": 2.2, "depth": 0.9, "height": 0.85 }
+  },
+  {
+    "id": 2,
+    "name": "Armchair",
+    "category": "seating",
+    "icon": "/products/icons/armchair.svg",
+    "image_url": "/products/icons/armchair.svg",
+    "dims": "0.85 x 0.85",
+    "dimensions": { "width": 0.85, "depth": 0.85, "height": 0.85 }
+  },
+  {
+    "id": 3,
+    "name": "Coffee Table",
+    "category": "table",
+    "icon": "/products/icons/coffee_table.svg",
+    "image_url": "/products/icons/coffee_table.svg",
+    "dims": "1.2 x 0.6",
+    "dimensions": { "width": 1.2, "depth": 0.6, "height": 0.45 }
+  },
+  {
+    "id": 4,
+    "name": "Dining Table",
+    "category": "table",
+    "icon": "/products/icons/dining_table.svg",
+    "image_url": "/products/icons/dining_table.svg",
+    "dims": "1.8 x 0.9",
+    "dimensions": { "width": 1.8, "depth": 0.9, "height": 0.75 }
+  },
+  {
+    "id": 5,
+    "name": "Double Bed",
+    "category": "bedroom",
+    "icon": "/products/icons/bed.svg",
+    "image_url": "/products/icons/bed.svg",
+    "dims": "1.6 x 2.0",
+    "dimensions": { "width": 1.6, "depth": 2.0, "height": 0.55 }
+  },
+  {
+    "id": 6,
+    "name": "Wardrobe",
+    "category": "storage",
+    "icon": "/products/icons/wardrobe.svg",
+    "image_url": "/products/icons/wardrobe.svg",
+    "dims": "1.8 x 0.6",
+    "dimensions": { "width": 1.8, "depth": 0.6, "height": 2.0 }
+  },
+  {
+    "id": 7,
+    "name": "TV Stand",
+    "category": "storage",
+    "icon": "/products/icons/tv_stand.svg",
+    "image_url": "/products/icons/tv_stand.svg",
+    "dims": "1.6 x 0.45",
+    "dimensions": { "width": 1.6, "depth": 0.45, "height": 0.5 }
+  },
+  {
+    "id": 8,
+    "name": "Bookshelf",
+    "category": "storage",
+    "icon": "/products/icons/bookshelf.svg",
+    "image_url": "/products/icons/bookshelf.svg",
+    "dims": "0.8 x 0.3",
+    "dimensions": { "width": 0.8, "depth": 0.3, "height": 1.8 }
+  },
+  {
+    "id": 9,
+    "name": "Work Desk",
+    "category": "office",
+    "icon": "/products/icons/desk.svg",
+    "image_url": "/products/icons/desk.svg",
+    "dims": "1.4 x 0.7",
+    "dimensions": { "width": 1.4, "depth": 0.7, "height": 0.75 }
+  },
+  {
+    "id": 10,
+    "name": "Floor Lamp",
+    "category": "lighting",
+    "icon": "/products/icons/lamp.svg",
+    "image_url": "/products/icons/lamp.svg",
+    "dims": "0.35 x 0.35",
+    "dimensions": { "width": 0.35, "depth": 0.35, "height": 1.6 }
+  }
+]
