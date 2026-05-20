@@ -16,7 +16,14 @@
   <div id="status-bar">Ready</div>
 </header>
 
-<div class="workspace">
+<!-- Mode tabs -->
+<div class="mode-bar">
+  <button class="mode-tab active" id="tab-surface">Surface Editor</button>
+  <button class="mode-tab" id="tab-floorplan">Floor Plan JSON</button>
+</div>
+
+<!-- ── Surface Editor workspace (existing) ── -->
+<div class="workspace" id="workspace-surface">
 
   <!-- Toolbar -->
   <div class="toolbar">
@@ -108,6 +115,12 @@
       </div>
     </div>
 
+    <!-- Sample images for testing -->
+    <div class="sidebar-section">
+      <div class="sidebar-section-title">Sample Test Images</div>
+      <div id="sample-images-list" style="padding:4px 8px 8px"></div>
+    </div>
+
     <!-- Product catalog -->
     <div class="sidebar-section-title" style="padding-top:10px">Products</div>
     <div class="catalog-list" id="catalog-list">
@@ -116,7 +129,47 @@
 
   </div><!-- /sidebar -->
 
-</div><!-- /workspace -->
+</div><!-- /workspace-surface -->
+
+<!-- ── Floor Plan JSON workspace (new) ── -->
+<div class="fp-workspace" id="workspace-floorplan" style="display:none">
+
+  <div class="fp-left">
+    <div class="fp-panel-header">Floor Plan JSON Payload</div>
+    <textarea id="fp-json" spellcheck="false"></textarea>
+    <div class="fp-controls">
+      <label for="fp-size" class="fp-label">Size</label>
+      <select id="fp-size">
+        <option value="1024x1024">1024 × 1024</option>
+        <option value="1536x1024">1536 × 1024 (landscape)</option>
+        <option value="1024x1536">1024 × 1536 (portrait)</option>
+      </select>
+      <button id="btn-fp-generate">
+        <span>⚡</span> Generate Floor Plan
+      </button>
+    </div>
+  </div>
+
+  <div class="fp-right">
+    <div class="fp-panel-header">
+      Generated Result
+      <span id="fp-status-tag" class="fp-status-tag"></span>
+    </div>
+    <div class="fp-result-area" id="fp-result-area">
+      <div class="fp-placeholder" id="fp-placeholder">
+        <div class="icon">🏗️</div>
+        <div>Paste your floor plan JSON and click Generate</div>
+      </div>
+      <img id="fp-result-img" alt="Generated floor plan" />
+      <a id="fp-result-download" style="display:none" class="fp-download-link">⬇ Download PNG</a>
+    </div>
+    <div class="fp-prompt-preview">
+      <div class="fp-prompt-label">Prompt sent to GPT</div>
+      <pre id="fp-prompt-text"></pre>
+    </div>
+  </div>
+
+</div><!-- /workspace-floorplan -->
 
 <script src="/static/app.js"></script>
 </body>

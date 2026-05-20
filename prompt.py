@@ -34,6 +34,8 @@ def _build_scale_lines(batch_items: List[Dict], room_w_m: float, room_h_m: float
         pid = item.get("product_id", "")
         dims_str = (item.get("dims") or item.get("dimensions") or "").strip()
         rotation = int(item.get("rotation") or 0)
+        x_m = item.get("x_m")
+        y_m = item.get("y_m")
 
         scale_line = ""
         dims_nums = re.findall(r"[\d.]+", dims_str) if dims_str else []
@@ -67,9 +69,19 @@ def _build_scale_lines(batch_items: List[Dict], room_w_m: float, room_h_m: float
         else:
             rot_line = "Orientation: natural top-down view (0° rotation). "
 
+        pos_pct_str = ""
+        if x_m is not None and y_m is not None and room_w_m and room_h_m:
+            pct_x = x_m / room_w_m * 100
+            pct_y = y_m / room_h_m * 100
+            pos_pct_str = (
+                f"Center position: {pct_x:.0f}% from left edge, {pct_y:.0f}% from top edge "
+                f"({100 - pct_x:.0f}% from right edge, {100 - pct_y:.0f}% from bottom edge). "
+            )
+
         lines.append(
             f"{idx}. PRODUCT_IMAGE {idx} (id={pid}): "
             f"{scale_line}"
+            f"{pos_pct_str}"
             f"{rot_line}"
             f"Place ONLY in GUIDE region matching hex {hc}. "
             f"Do not substitute a different product type."
@@ -115,7 +127,13 @@ def build_floor_placement_prompt(
             + (f" ({unit})." if unit else ".")
         )
     elif unit and width and height:
-        room_dim_sentence = f"The room spans approximately {width} × {height} {unit}."
+        room_dim_sentence = (
+            f"The room spans approximately {width} × {height} {unit}.\n"
+            f"Coordinate system: origin (0,0) is the TOP-LEFT corner of the surface. "
+            f"x increases rightward (0=left edge, {width}=right edge). "
+            f"y increases downward (0=top edge, {height}=bottom edge). "
+            f"Units: {unit}."
+        )
     else:
         room_dim_sentence = (
             "Use wall boundaries in BASE_IMAGE to infer room footprint if explicit room size is missing."
@@ -300,4 +318,275 @@ def build_placement_prompt(
 ) -> str:
     if generation_type == "wall":
         return build_wall_placement_prompt(batch_items, room_dimensions, presets)
-    return build_floor_placement_prompt(batch_items, room_dimensions, presets)
+    return  (batch_items, room_dimensions, presets)
+
+
+def _build_derived_view_prompt(
+    payload: dict,
+    image_order: Optional[List[str]] = None,
+    view: str = "front",
+) -> str:
+    """Prompt for front/corner views when IMAGE 1 is the isometric render."""
+    room = payload.get("room", {})
+    fl = room.get("flooring", {})
+    walls_cfg = room.get("walls", {})
+    lighting = payload.get("lighting", {})
+
+    # Appearance (same as main prompt)
+    app: List[str] = ["Ultra-realistic architectural visualization"]
+    lt = (lighting.get("type") or "natural_daylight").replace("_", " ")
+    if "natural" in lt.lower() or "daylight" in lt.lower():
+        app.append("warm natural daylight, soft ambient light from windows")
+    floor_bits = [fl.get("material", ""), fl.get("type", "")]
+    floor_str = " ".join(b for b in floor_bits if b).strip()
+    if floor_str:
+        app.append(f"{floor_str} flooring")
+    wall_color = walls_cfg.get("color", "")
+    if wall_color:
+        app.append(f"walls painted {wall_color}")
+    app += ["soft drop-shadows", "realistic material textures (fabric, wood, metal)",
+            "no sticker or cutout look", "editorial photography quality"]
+    appearance = ", ".join(app) + "."
+
+    view_lines = {
+        "front": (
+            "Eye-level interior perspective — camera at 1.2 m height outside the SOUTH wall "
+            "looking straight NORTH, full room width in frame, all furniture fully visible, no cropping."
+        ),
+        "corner": (
+            "Wide-angle 3D corner perspective — camera pulled far back and elevated outside the SW corner "
+            "looking diagonally toward the NE corner. Entire room visible, all four walls, "
+            "every furniture piece in frame. Do not zoom in."
+        ),
+    }
+    view_line = view_lines[view]
+
+    # Image reference block
+    img_order = image_order or []
+    ref_lines = [
+        "IMAGE 1 is a top-down isometric render of the room — it is the ground truth for "
+        "furniture layout, product identities, positions, sizes, and room dimensions. "
+        "Re-render this exact scene from the camera angle described above.",
+    ]
+    if img_order:
+        ref_lines.append("Product reference photos — match materials and appearance exactly:")
+        for i, pid in enumerate(img_order, start=1):
+            ref_lines.append(f"  IMAGE {i + 1} = product id={pid}")
+    refs = "\n".join(ref_lines)
+
+    n = len(payload.get("products", []))
+    constraints = (
+        f"HARD CONSTRAINTS: "
+        f"(1) Render exactly the same {n} furniture item(s) visible in IMAGE 1 — same products, same positions, same layout. "
+        f"(2) Match each product's material and finish to its reference photo (IMAGE 2+). "
+        f"(3) No extra furniture, accessories, rugs, lamps, or decor not in IMAGE 1. "
+        f"(4) No text, labels, dimension lines, or watermarks."
+    )
+
+    return "\n\n".join(filter(None, [appearance, view_line, refs, constraints])).strip() + (
+        "\n\nOutput: one photorealistic render, no overlays, no on-image text."
+    )
+
+
+def build_floor_plan_prompt(
+    payload: dict,
+    image_order: Optional[List[str]] = None,
+    has_guide: bool = False,
+    view: str = "isometric",
+    iso_base: bool = False,
+) -> str:
+    """
+    Strict separation of concerns:
+      JSON data  → all geometry (positions, dimensions, rotations, layout)
+      English    → appearance only (materials, lighting, mood, render quality)
+
+    image_order: product IDs in the order their photos are attached (IMAGE 2, 3, …).
+    has_guide:   True when IMAGE 1 is a hand-drawn colour-blob guide (Surface Editor).
+    view:        "isometric" | "front" | "corner"
+    iso_base:    True for front/corner — IMAGE 1 is the isometric render, not a blank canvas.
+    """
+    if iso_base and view in ("front", "corner"):
+        return _build_derived_view_prompt(payload, image_order=image_order, view=view)
+
+    room = payload.get("room", {})
+    fl = room.get("flooring", {})
+    walls_cfg = room.get("walls", {})
+    lighting = payload.get("lighting", {})
+
+    # ── English appearance paragraph — NO geometry, NO coordinates ───────────
+    app: List[str] = ["Ultra-realistic architectural visualization"]
+
+    lt = (lighting.get("type") or "natural_daylight").replace("_", " ")
+    if "natural" in lt.lower() or "daylight" in lt.lower():
+        app.append("warm natural daylight, soft ambient light from windows")
+    elif lt.strip():
+        app.append(lt)
+
+    floor_bits = [fl.get("material", ""), fl.get("type", "")]
+    floor_str = " ".join(b for b in floor_bits if b).strip()
+    if floor_str:
+        d = fl.get("plank_direction") or fl.get("direction", "")
+        app.append(f"{floor_str} flooring" + (f", {d} planks" if d else ""))
+
+    wall_color = walls_cfg.get("color", "")
+    if wall_color:
+        app.append(f"walls painted {wall_color}")
+
+    for p in payload.get("products", []):
+        mat = p.get("material")
+        if isinstance(mat, dict):
+            app.extend(str(v) for v in mat.values() if v)
+        elif isinstance(mat, str) and mat:
+            app.append(mat)
+
+    decor = payload.get("decor_style") or ""
+    if decor:
+        app.append(f"{decor.replace('_', ' ')} interior")
+
+    app += [
+        "soft drop-shadows beneath each furniture piece",
+        "realistic material textures (fabric, wood, metal)",
+        "no sticker or cutout look",
+        "editorial photography quality",
+    ]
+
+    appearance = ", ".join(app) + "."
+
+    # ── Camera / view ─────────────────────────────────────────────────────────
+    _VIEW_CAMERAS = {
+        "isometric": {"name": "isometric_top_view", "fov": 35},
+        "front":     {"name": "front_view",          "fov": 50},
+        "corner":    {"name": "corner_view",          "fov": 65},
+    }
+    _VIEW_LINES = {
+        "isometric": (
+            "Top-down 3D isometric perspective, full room footprint in frame, no tight crop."
+        ),
+        "front": (
+            "Eye-level interior perspective — camera at 1.2 m height positioned outside "
+            "the SOUTH wall looking straight NORTH, full room width in frame, "
+            "all furniture fully visible, no cropping."
+        ),
+        "corner": (
+            "Wide-angle 3D corner perspective — camera pulled far back and elevated, "
+            "placed outside the SW corner looking diagonally toward the NE corner. "
+            "The entire room floor plan must be visible. "
+            "Show all four walls and every furniture piece without cropping. "
+            "Do not zoom in — keep the whole room in frame."
+        ),
+    }
+    view_line = _VIEW_LINES.get(view, _VIEW_LINES["isometric"])
+
+    # ── Product image references ───────────────────────────────────────────────
+    img_order = image_order or []
+    products_by_id = {p["id"]: p for p in payload.get("products", [])}
+    ref_lines: List[str] = []
+
+    if has_guide and img_order:
+        ref_lines.append(
+            "IMAGE 1 is a colour-blob placement guide — each blob marks WHERE a product goes. "
+            "Match each blob colour to its product reference photo:"
+        )
+        for i, pid in enumerate(img_order, start=1):
+            hc = products_by_id.get(pid, {}).get("hex_color", "")
+            if hc:
+                ref_lines.append(f"  {hc} → IMAGE {i + 1}")
+        ref_lines.append(
+            "Replace every coloured blob with its photorealistic furniture piece. "
+            "Show bare floor everywhere else."
+        )
+    elif img_order:
+        ref_lines.append("Product reference photos — render each item to exactly match its image:")
+        for i, pid in enumerate(img_order, start=1):
+            ref_lines.append(f"  IMAGE {i + 1} = product id={pid}")
+
+    refs = "\n".join(ref_lines)
+
+    # ── Geometry block — raw JSON with percentage anchors added ──────────────
+    room_w = float(room.get("width") or 0)
+    room_l = float(room.get("length") or 0)
+
+    _FACING = {0: "NORTH", 90: "EAST", 180: "SOUTH", 270: "WEST"}
+
+    clean_products = []
+    for p in payload.get("products", []):
+        cp = {k: v for k, v in p.items() if k not in ("material", "image_url", "hex_color")}
+        # Enrich position with x_pct / y_pct so model can cross-check metre vs percentage
+        pos = cp.get("position", {})
+        if pos and room_w and room_l:
+            x, y = float(pos.get("x") or 0), float(pos.get("y") or 0)
+            cp["position"] = {
+                **pos,
+                "x_pct": round(x / room_w * 100, 1),
+                "y_pct": round(y / room_l * 100, 1),
+            }
+        # Translate rotation_y to a compass facing so the model understands orientation
+        rot = int(cp.get("rotation_y") or 0) % 360
+        cp["facing"] = _FACING.get(rot, f"{rot}deg_CW")
+        cp["facing_note"] = (
+            f"The FRONT of this product faces {cp['facing']} — "
+            f"rotate it {rot}° clockwise from its reference photo orientation."
+        )
+        clean_products.append(cp)
+
+    # ── Per-product rotation summary (English, before JSON) ──────────────────
+    rotation_lines = []
+    for p in payload.get("products", []):
+        rot = int(p.get("rotation_y") or 0) % 360
+        pid = p.get("id", "?")
+        cat = (p.get("category") or pid).replace("_", " ")
+        facing = _FACING.get(rot, f"{rot}°")
+        dims = p.get("dimensions", {})
+        w = float(dims.get("width") or 0)
+        d = float(dims.get("depth") or 0)
+        if rot == 0:
+            rotation_lines.append(f"  {cat}: 0° — use reference photo orientation as-is.")
+        elif rot == 90:
+            long_axis = "width" if d > w else "depth"
+            rotation_lines.append(
+                f"  {cat}: 90° CW — its longer dimension runs LEFT↔RIGHT; front faces EAST."
+            )
+        elif rot == 180:
+            rotation_lines.append(
+                f"  {cat}: 180° — completely flipped from reference photo; front faces SOUTH."
+            )
+        elif rot == 270:
+            rotation_lines.append(
+                f"  {cat}: 270° CW — its longer dimension runs LEFT↔RIGHT; front faces WEST."
+            )
+        else:
+            rotation_lines.append(f"  {cat}: {rot}° CW from reference photo; front faces {facing}.")
+
+    rotation_block = (
+        "PRODUCT ROTATIONS — apply exactly before placing in the room:\n"
+        + "\n".join(rotation_lines)
+    ) if rotation_lines else ""
+
+    geometry = {
+        "unit": payload.get("unit", "m"),
+        "room": payload.get("room", {}),
+        "openings": payload.get("openings", []),
+        "products": clean_products,
+        "camera_views": [_VIEW_CAMERAS.get(view, _VIEW_CAMERAS["isometric"])],
+    }
+    geometry_block = (
+        "Room geometry — positions, dimensions, and rotations are exact; render precisely to these values.\n"
+        "Coordinate system: origin (0,0) = NW corner; x increases EAST; y increases SOUTH.\n"
+        "Facing: NORTH = toward top of room (y=0 wall); SOUTH = toward bottom (y=max wall); "
+        "EAST = toward right (x=max wall); WEST = toward left (x=0 wall).\n"
+        + json.dumps(geometry, ensure_ascii=False, indent=2)
+    )
+
+    # ── Hard constraints ───────────────────────────────────────────────────────
+    n = len(payload.get("products", []))
+    constraints = (
+        f"HARD CONSTRAINTS: "
+        f"(1) Exactly {n} furniture item(s) — no extra accessories, rugs, lamps, plants, or decor. "
+        f"(2) No architectural elements beyond those in the geometry JSON. "
+        f"(3) Render each product to exactly match its reference image — same shape, style, upholstery, finish. "
+        f"(4) No text, labels, dimension lines, or watermarks in the output."
+    )
+
+    return "\n\n".join(filter(None, [appearance, view_line, rotation_block, refs, geometry_block, constraints])).strip() + (
+        "\n\nOutput: one photorealistic render, no overlays, no on-image text."
+    )

@@ -461,23 +461,44 @@ function renderSurface() {
 
   // Placed products
   S.placedProducts.forEach(pp => {
+    const rot = (pp.rotation || 0) * Math.PI / 180;
+    const cxMid = pp.cx + pp.wPx / 2;
+    const cyMid = pp.cy + pp.hPx / 2;
+
+    // Colored fill rect (dimensions already reflect rotation via wPx/hPx swap)
     ctx2.fillStyle = pp.color + 'cc';
     ctx2.fillRect(pp.cx, pp.cy, pp.wPx, pp.hPx);
     ctx2.strokeStyle = pp.color;
     ctx2.lineWidth = 2;
     ctx2.strokeRect(pp.cx, pp.cy, pp.wPx, pp.hPx);
 
-    // Product icon inside
+    // Product icon — draw rotated so orientation is visually correct
     if (pp.img) {
-      const iconPad = 4;
-      ctx2.drawImage(pp.img, pp.cx + iconPad, pp.cy + iconPad, pp.wPx - iconPad * 2, pp.hPx - iconPad * 2);
+      ctx2.save();
+      ctx2.translate(cxMid, cyMid);
+      ctx2.rotate(rot);
+      // In rotated context, natural image dims are the pre-swap dimensions
+      const imgW = (pp.rotation % 180 === 0) ? pp.wPx : pp.hPx;
+      const imgH = (pp.rotation % 180 === 0) ? pp.hPx : pp.wPx;
+      const pad = 4;
+      ctx2.drawImage(pp.img, -(imgW / 2) + pad, -(imgH / 2) + pad, imgW - pad * 2, imgH - pad * 2);
+      ctx2.restore();
     }
 
-    // Label
+    // Label + rotation badge
     ctx2.fillStyle = '#fff';
     ctx2.font = 'bold 9px sans-serif';
     ctx2.textAlign = 'center';
-    ctx2.fillText(pp.product.name, pp.cx + pp.wPx / 2, pp.cy + pp.hPx / 2);
+    ctx2.textBaseline = 'middle';
+    ctx2.fillText(pp.product.name, cxMid, cyMid);
+    if (pp.rotation) {
+      ctx2.font = '8px sans-serif';
+      ctx2.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx2.fillRect(pp.cx + pp.wPx - 22, pp.cy + 2, 20, 12);
+      ctx2.fillStyle = '#fff';
+      ctx2.textAlign = 'center';
+      ctx2.fillText(`${pp.rotation}°`, pp.cx + pp.wPx - 12, pp.cy + 9);
+    }
   });
 
   // Dimension labels
@@ -526,11 +547,12 @@ function placeProduct(product, dropX, dropY) {
 
   const color = pickColor();
 
-  // Preload icon image
+  // Preload icon image (for canvas display only)
   const img = new Image();
   img.src = product.icon;
 
-  const pp = { id: ++placedIdSeq, product, color, cx, cy, wPx, hPx, img };
+  // imageUrl: the real product photo URL used for AI generation (not the SVG icon)
+  const pp = { id: ++placedIdSeq, product, color, cx, cy, wPx, hPx, img, imageUrl: '', rotation: 0 };
   img.onload = () => renderSurface();
 
   S.placedProducts.push(pp);
@@ -581,10 +603,21 @@ function updatePlacedList() {
   const items = S.placedProducts.map(pp => {
     const div = document.createElement('div');
     div.className = 'placed-item';
+    const hasUrl = !!pp.imageUrl.trim();
     div.innerHTML = `
-      <div class="color-swatch" style="background:${pp.color}"></div>
-      <span class="name">${pp.product.name}</span>
-      <button class="remove-btn" data-id="${pp.id}" title="Remove">×</button>
+      <div class="placed-item-row">
+        <div class="color-swatch" style="background:${pp.color}"></div>
+        <span class="name">${pp.product.name}</span>
+        <button class="rotate-btn" data-id="${pp.id}" title="Rotate 90°">↻ ${pp.rotation || 0}°</button>
+        <button class="remove-btn" data-id="${pp.id}" title="Remove">×</button>
+      </div>
+      <input
+        class="placed-img-url ${hasUrl ? 'has-url' : ''}"
+        data-id="${pp.id}"
+        type="url"
+        placeholder="Paste product photo URL (PNG/JPG)"
+        value="${pp.imageUrl}"
+      />
     `;
     return div;
   });
@@ -597,12 +630,46 @@ function updatePlacedList() {
       updateGenerateBtn();
       renderSurface();
     });
+    el.querySelector('.rotate-btn').addEventListener('click', evt => {
+      const id = parseInt(evt.target.dataset.id);
+      const pp = S.placedProducts.find(p => p.id === id);
+      if (!pp) return;
+      const wasPortrait = pp.rotation % 180 !== 0;
+      pp.rotation = (pp.rotation + 90) % 360;
+      const isPortrait = pp.rotation % 180 !== 0;
+      // Swap wPx/hPx when toggling between landscape (0°/180°) and portrait (90°/270°)
+      if (wasPortrait !== isPortrait) {
+        [pp.wPx, pp.hPx] = [pp.hPx, pp.wPx];
+        // Re-clamp so product stays inside surface bounds
+        const t = c2._transform;
+        if (t) {
+          pp.cx = Math.max(t.ox, Math.min(t.ox + t.surfW - pp.wPx, pp.cx));
+          pp.cy = Math.max(t.oy, Math.min(t.oy + t.surfH - pp.hPx, pp.cy));
+        }
+      }
+      updatePlacedList();
+      renderSurface();
+    });
+    el.querySelector('.placed-img-url').addEventListener('input', evt => {
+      const id = parseInt(evt.target.dataset.id);
+      const pp = S.placedProducts.find(p => p.id === id);
+      if (pp) {
+        pp.imageUrl = evt.target.value;
+        evt.target.classList.toggle('has-url', !!pp.imageUrl.trim());
+      }
+      updateGenerateBtn();
+    });
     placedList.appendChild(el);
   });
 }
 
 function updateGenerateBtn() {
-  btnGenerate.disabled = S.placedProducts.length === 0 || S.isGenerating;
+  const hasProducts = S.placedProducts.length > 0;
+  const allHaveUrls = S.placedProducts.every(pp => pp.imageUrl.trim());
+  btnGenerate.disabled = !hasProducts || !allHaveUrls || S.isGenerating;
+  btnGenerate.title = hasProducts && !allHaveUrls
+    ? 'Add a product photo URL for each placed product'
+    : '';
 }
 
 // ── Toolbar buttons ────────────────────────────────────────────
@@ -719,13 +786,22 @@ btnGenerate.addEventListener('click', async () => {
   if (!highlightImg) { setStatus('Cannot export surface image', 'error'); return; }
 
   const t = c2._transform;
-  const products = S.placedProducts.map(pp => ({
-    product_id: pp.product.id,
-    image_url: `${window.location.origin}${pp.product.image_url}`,
-    hex_color: pp.color,
-    dims: pp.product.dims || '',
-    rotation: 0,
-  }));
+  const products = S.placedProducts.map(pp => {
+    // Center position in metres within the surface
+    const x_m = t ? parseFloat(((pp.cx - t.ox + pp.wPx / 2) / t.sc).toFixed(3)) : null;
+    const y_m = t ? parseFloat(((pp.cy - t.oy + pp.hPx / 2) / t.sc).toFixed(3)) : null;
+    return {
+      product_id: pp.product.id,
+      category: pp.product.category || '',
+      image_url: pp.imageUrl.trim(),
+      hex_color: pp.color,
+      dims: pp.product.dims || '',
+      dimensions: pp.product.dimensions || null,  // physical (unrotated) metres
+      rotation: pp.rotation || 0,
+      x_m,
+      y_m,
+    };
+  });
 
   const roomDimensions = {
     width: S.selectedSurface.widthM,
@@ -789,7 +865,7 @@ async function pollGeneration(genId) {
         setStatus('Generation complete!', 'success');
         S.isGenerating = false;
         updateGenerateBtn();
-        showResult(data.result_image);
+        showResult(data.result_images || { isometric: data.result_image });
       } else if (data.status === 'failed') {
         setStatus(`Generation failed: ${data.reason || 'unknown error'}`, 'error');
         S.isGenerating = false;
@@ -805,15 +881,354 @@ async function pollGeneration(genId) {
   setTimeout(poll, INTERVAL);
 }
 
-function showResult(imageUrl) {
+const VIEW_LABELS = { isometric: 'Top View', front: 'Front View', corner: 'Corner View' };
+const VIEW_ORDER  = ['isometric', 'front', 'corner'];
+
+function buildCarousel(images, prefix) {
+  const views = VIEW_ORDER.filter(k => images[k]);
+  if (!views.length) return null;
+  let idx = 0;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'carousel-wrap';
+
+  const label = document.createElement('div');
+  label.className = 'carousel-label';
+
+  const imgEl = document.createElement('img');
+  imgEl.className = 'carousel-img';
+
+  const dlLink = document.createElement('a');
+  dlLink.className = 'carousel-dl';
+  dlLink.textContent = '⬇ Download';
+
+  const nav = document.createElement('div');
+  nav.className = 'carousel-nav';
+
+  const prevBtn = document.createElement('button');
+  prevBtn.className = 'carousel-btn';
+  prevBtn.textContent = '‹';
+
+  const counter = document.createElement('span');
+  counter.className = 'carousel-counter';
+
+  const nextBtn = document.createElement('button');
+  nextBtn.className = 'carousel-btn';
+  nextBtn.textContent = '›';
+
+  nav.append(prevBtn, counter, nextBtn);
+  wrap.append(label, imgEl, dlLink, nav);
+
+  function show(i) {
+    idx = (i + views.length) % views.length;
+    const key = views[idx];
+    label.textContent = VIEW_LABELS[key] || key;
+    imgEl.src = images[key];
+    dlLink.href = images[key];
+    dlLink.download = `${prefix}_${key}.png`;
+    counter.textContent = `${idx + 1} / ${views.length}`;
+    prevBtn.disabled = views.length <= 1;
+    nextBtn.disabled = views.length <= 1;
+  }
+
+  prevBtn.addEventListener('click', () => show(idx - 1));
+  nextBtn.addEventListener('click', () => show(idx + 1));
+  show(0);
+  return wrap;
+}
+
+function showResult(images) {
   resultSection.style.display = '';
-  resultImg.src = imageUrl;
-  resultImg.classList.add('visible');
-  resultDownload.href = imageUrl;
-  resultDownload.download = 'generated.png';
-  resultDownload.style.display = 'block';
+  resultImg.style.display = 'none';
+  resultDownload.style.display = 'none';
+  const container = resultImg.parentElement;
+  container.querySelectorAll('.carousel-wrap').forEach(el => el.remove());
+  const carousel = buildCarousel(images, 'generated');
+  if (carousel) container.appendChild(carousel);
+}
+
+// ── Mode tab switching ─────────────────────────────────────────
+const tabSurface   = document.getElementById('tab-surface');
+const tabFloorplan = document.getElementById('tab-floorplan');
+const wsSurface    = document.getElementById('workspace-surface');
+const wsFP         = document.getElementById('workspace-floorplan');
+
+tabSurface.addEventListener('click', () => {
+  tabSurface.classList.add('active');
+  tabFloorplan.classList.remove('active');
+  wsSurface.style.display = '';
+  wsFP.style.display = 'none';
+  resizeCanvases();
+});
+
+tabFloorplan.addEventListener('click', () => {
+  tabFloorplan.classList.add('active');
+  tabSurface.classList.remove('active');
+  wsSurface.style.display = 'none';
+  wsFP.style.display = '';
+});
+
+// ── Floor Plan JSON generation ────────────────────────────────
+const DEMO_PAYLOAD = {
+  "scene_id": "living_room_demo_001",
+  "unit": "m",
+  "room": {
+    "width": 5,
+    "length": 7,
+    "height": 3,
+    "flooring": {
+      "type": "wood",
+      "material": "light oak",
+      "plank_direction": "horizontal",
+      "plank_size": [1.2, 0.2]
+    },
+    "walls": {
+      "thickness": 0.12,
+      "color": "#F3EFE8"
+    }
+  },
+  "openings": [
+    {
+      "id": "window_01",
+      "type": "window",
+      "wall": "north",
+      "position_from_left": 1.7,
+      "width": 1.6,
+      "height": 0.9,
+      "sill_height": 1.2,
+      "frame_material": "oak wood"
+    },
+    {
+      "id": "door_01",
+      "type": "door",
+      "wall": "south",
+      "position_from_left": 2.05,
+      "width": 0.9,
+      "height": 2.2,
+      "swing": "inward-left",
+      "material": "oak wood"
+    }
+  ],
+  "products": [
+    {
+      "id": "sofa_main",
+      "category": "three_seater_sofa",
+      "image_url": "https://www.customcreation.com.pk/wp-content/uploads/2025/01/SOFIA-%E2%80%93-Solid-Wood-Upholstered-3-Seater-Sofa-1.jpg",
+      "dimensions": { "width": 2.2, "depth": 0.9, "height": 0.85 },
+      "position": { "x": 0.45, "y": 3.5, "z": 0 },
+      "rotation_y": 90,
+      "material": { "fabric": "cream boucle" }
+    },
+    {
+      "id": "bed_main",
+      "category": "bed",
+      "image_url": "https://furniturecity.com.pk/cdn/shop/files/image_1800x1800_a5d1c19e-294b-44a7-915f-67ba9ce9c301.jpg?v=1710531159",
+      "dimensions": { "width": 1.6, "depth": 2.0, "height": 0.5 },
+      "position": { "x": 2.5, "y": 1.0, "z": 0 },
+      "rotation_y": 0,
+      "material": { "fabric": "cream boucle" }
+    }
+  ],
+  "lighting": {
+    "type": "natural_daylight",
+    "sun_direction": "north",
+    "intensity": 0.85
+  },
+  "camera_views": [
+    {
+      "name": "front_view",
+      "camera_position": [250, -220, 170],
+      "target": [250, 540, 100],
+      "fov": 35
+    },
+    {
+      "name": "corner_view",
+      "camera_position": [-180, -120, 190],
+      "target": [250, 540, 100],
+      "fov": 40
+    }
+  ]
+};
+
+const fpJsonEl       = document.getElementById('fp-json');
+const fpSizeEl       = document.getElementById('fp-size');
+const btnFpGenerate  = document.getElementById('btn-fp-generate');
+const fpStatusTag    = document.getElementById('fp-status-tag');
+const fpResultImg    = document.getElementById('fp-result-img');
+const fpResultDl     = document.getElementById('fp-result-download');
+
+function showFpResult(images) {
+  fpResultImg.style.display = 'none';
+  fpResultDl.style.display = 'none';
+  const container = fpResultImg.parentElement;
+  container.querySelectorAll('.carousel-wrap').forEach(el => el.remove());
+  const carousel = buildCarousel(images, 'floor_plan');
+  if (carousel) container.appendChild(carousel);
+}
+const fpPlaceholder  = document.getElementById('fp-placeholder');
+const fpPromptText   = document.getElementById('fp-prompt-text');
+
+fpJsonEl.value = JSON.stringify(DEMO_PAYLOAD, null, 2);
+
+let fpGenerating = false;
+
+btnFpGenerate.addEventListener('click', async () => {
+  if (fpGenerating) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(fpJsonEl.value);
+  } catch (e) {
+    setFpStatus('Invalid JSON: ' + e.message, 'error');
+    return;
+  }
+
+  payload.size = fpSizeEl.value;
+
+  fpGenerating = true;
+  btnFpGenerate.disabled = true;
+  setFpStatus('Generating…', 'processing');
+  fpPlaceholder.style.display = '';
+  fpResultImg.classList.remove('visible');
+  fpResultDl.style.display = 'none';
+  fpPromptText.textContent = '';
+  setStatus('Floor plan generation started…', 'processing');
+
+  let genId;
+  try {
+    const res = await fetch('/api/floor-plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    genId = data.gen_id;
+  } catch (err) {
+    setFpStatus('Failed: ' + err.message, 'error');
+    setStatus('Floor plan failed', 'error');
+    fpGenerating = false;
+    btnFpGenerate.disabled = false;
+    return;
+  }
+
+  pollFpGeneration(genId);
+});
+
+async function pollFpGeneration(genId) {
+  const INTERVAL = 2500;
+  const MAX_WAIT = 5 * 60 * 1000;
+  const start = Date.now();
+
+  const poll = async () => {
+    if (Date.now() - start > MAX_WAIT) {
+      setFpStatus('Timed out', 'error');
+      setStatus('Floor plan timed out', 'error');
+      fpGenerating = false;
+      btnFpGenerate.disabled = false;
+      return;
+    }
+    try {
+      const res = await fetch(`/api/generate/${genId}`);
+      const data = await res.json();
+
+      if (data.status === 'success') {
+        setFpStatus('Done', 'success');
+        setStatus('Floor plan complete!', 'success');
+        fpPlaceholder.style.display = 'none';
+        fpGenerating = false;
+        btnFpGenerate.disabled = false;
+        fetchFpPromptPreview(genId);
+        showFpResult(data.result_images || { isometric: data.result_image });
+      } else if (data.status === 'failed') {
+        setFpStatus('Failed: ' + (data.reason || 'unknown'), 'error');
+        setStatus('Floor plan failed', 'error');
+        fpGenerating = false;
+        btnFpGenerate.disabled = false;
+      } else {
+        setTimeout(poll, INTERVAL);
+      }
+    } catch {
+      setTimeout(poll, INTERVAL);
+    }
+  };
+
+  setTimeout(poll, INTERVAL);
+}
+
+async function fetchFpPromptPreview(genId) {
+  // Show a truncated version of what was sent — parse the JSON and rebuild
+  try {
+    const payload = JSON.parse(fpJsonEl.value);
+    // Ask backend for a preview via a lightweight endpoint if available;
+    // for now just show a summary from the payload
+    const room = payload.room || {};
+    const n = (payload.products || []).length;
+    fpPromptText.textContent =
+      `Room ${room.width}×${room.length}${payload.unit}, ${room.height}${payload.unit} ceiling\n` +
+      `${(payload.openings || []).length} opening(s), ${n} furniture piece(s)\n` +
+      `Lighting: ${(payload.lighting || {}).type || 'N/A'}\n` +
+      `View: ${((payload.camera_views || [])[0] || {}).name || 'N/A'}\n` +
+      `Size: ${payload.size || '1024x1024'}`;
+  } catch { /* ignore */ }
+}
+
+function setFpStatus(msg, cls = '') {
+  fpStatusTag.textContent = msg;
+  fpStatusTag.className = 'fp-status-tag' + (cls ? ' ' + cls : '');
+}
+
+// ── Sample test images ─────────────────────────────────────────
+const SAMPLE_IMAGES = [
+  {
+    label: 'Sofia 3-Seater Sofa',
+    url: 'https://www.customcreation.com.pk/wp-content/uploads/2025/01/SOFIA-%E2%80%93-Solid-Wood-Upholstered-3-Seater-Sofa-1.jpg',
+  },
+  {
+    label: 'Furniture City Bed',
+    url: 'https://furniturecity.com.pk/cdn/shop/files/image_1800x1800_a5d1c19e-294b-44a7-915f-67ba9ce9c301.jpg?v=1710531159',
+  },
+];
+
+function renderSampleImages() {
+  const container = document.getElementById('sample-images-list');
+  if (!container) return;
+  container.innerHTML = '';
+  SAMPLE_IMAGES.forEach(si => {
+    const div = document.createElement('div');
+    div.className = 'sample-img-item';
+    div.innerHTML = `
+      <img src="${si.url}" alt="${si.label}" class="sample-img-thumb" />
+      <div class="sample-img-info">
+        <div class="sample-img-label">${si.label}</div>
+        <button class="sample-img-use" data-url="${si.url}">Use →</button>
+      </div>
+    `;
+    div.querySelector('.sample-img-use').addEventListener('click', evt => {
+      const url = evt.target.dataset.url;
+      // Assign to the first placed product without a URL
+      const unset = S.placedProducts.find(pp => !pp.imageUrl.trim());
+      if (unset) {
+        unset.imageUrl = url;
+        updatePlacedList();
+        updateGenerateBtn();
+        setStatus(`Assigned to ${unset.product.name}`, '');
+      } else if (S.placedProducts.length > 0) {
+        // Reassign the last product
+        const last = S.placedProducts[S.placedProducts.length - 1];
+        last.imageUrl = url;
+        updatePlacedList();
+        updateGenerateBtn();
+        setStatus(`Assigned to ${last.product.name}`, '');
+      } else {
+        setStatus('Place a product first, then assign an image', '');
+      }
+    });
+    container.appendChild(div);
+  });
 }
 
 // ── Init ───────────────────────────────────────────────────────
 loadCatalog();
 resizeCanvases();
+renderSampleImages();
