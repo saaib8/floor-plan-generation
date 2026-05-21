@@ -1089,6 +1089,7 @@ btnGenerate.addEventListener('click', async () => {
     return {
       product_id: pp.product.id,
       category: pp.product.category || '',
+      product_name: pp.product.name || pp.product.category || '',
       image_url: pp.imageUrl.trim(),
       hex_color: pp.color,
       dims: pp.product.dims || '',

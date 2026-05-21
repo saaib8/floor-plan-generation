@@ -5,6 +5,7 @@ from pydantic import BaseModel
 class ProductItem(BaseModel):
     product_id: Optional[int] = None
     category: Optional[str] = None
+    product_name: Optional[str] = None  # human-readable name e.g. "Work Desk", "Double Bed"
     image_url: str
     hex_color: str
     dims: Optional[str] = None

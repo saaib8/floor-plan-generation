@@ -697,24 +697,24 @@ def build_floor_plan_prompt(
             "PRODUCT IDENTITY FIDELITY — EQUALLY IMPORTANT AS PLACEMENT ACCURACY:"
         )
         identity_lines.append(
-            "Each product reference photo (IMAGE 2, 3, …) is the EXACT product to render. "
-            "Copy its visual identity pixel-for-pixel:"
+            "IMPORTANT: Reference photos may contain OTHER objects (chairs at desks, pillows on beds, "
+            "rugs under tables, plants, accessories). These are staging props — IGNORE THEM. "
+            "From each reference photo, extract and render ONLY the single named product below."
         )
         for i, pid in enumerate(img_order, start=1):
             identity_lines.append(
-                f"  IMAGE {i + 1} ({pid}): Copy the EXACT design, upholstery, color, pattern, "
-                f"frame style, legs, and all visible details from this photo. "
-                f"Do NOT add, remove, or alter any element."
+                f"  IMAGE {i + 1} → render ONLY the \"{pid}\" — copy its exact design, shape, color, "
+                f"material, frame, and structure. IGNORE any other furniture, chairs, accessories, "
+                f"or objects visible in the same photo — they are staging props, not products to render."
             )
         identity_lines.append(
             "\nIDENTITY RULES:\n"
-            "- Do NOT add throws, blankets, cushions, pillows, or accessories not visible in the reference photo.\n"
-            "- Do NOT change the fabric color, pattern, or material from what the reference photo shows.\n"
-            "- Do NOT redesign the product shape, frame, or structure — copy it faithfully.\n"
+            "- From each reference photo, render ONLY the single named product. All other objects in the photo are staging — discard them.\n"
+            "- If a desk photo shows a chair, render ONLY the desk. If a bed photo shows side tables, render ONLY the bed.\n"
+            "- Do NOT change the fabric color, pattern, or material of the named product.\n"
+            "- Do NOT redesign the product shape, frame, or structure — copy the named product faithfully.\n"
             "- Do NOT add extra hardware (handles, locks, knobs) to doors or furniture beyond what the reference shows.\n"
-            "- If the reference shows a plain bed, render a plain bed — no decorative throws or extra pillows.\n"
-            "- If the reference shows a simple door, render that exact door — no extra locks or panels.\n"
-            "- The reference photo is the SOLE source of truth for each product's appearance."
+            "- The reference photo defines ONLY the appearance of the named product — nothing else from the photo should appear in the render."
         )
     identity_block = "\n".join(identity_lines) if identity_lines else ""
 
@@ -820,12 +820,13 @@ def build_floor_plan_prompt(
     n_openings = len(openings)
     constraints = (
         f"HARD CONSTRAINTS — every rule is mandatory, violation = failure:\n"
-        f"(1) Exactly {n} furniture item(s) — no extra accessories, throws, blankets, rugs, lamps, plants, cushions, or decor not in the reference photos.\n"
+        f"(1) Exactly {n} furniture item(s) in total — no more, no fewer. Do NOT add chairs, stools, rugs, lamps, plants, "
+        f"cushions, throws, blankets, or any object from a reference photo's background/staging.\n"
         f"(2) Only render architectural openings listed in the JSON openings array — no extra doors, windows, or skylights.\n"
-        f"(3) EXACT PRODUCT IDENTITY: Each product MUST be a faithful copy of its reference photo (IMAGE 2, 3, …). "
-        f"Same design, same colors, same structure, same details — do NOT redesign, restyle, or add elements.\n"
+        f"(3) PRODUCT IDENTITY: Copy ONLY the named product from each reference photo. Ignore staging props visible in the photo. "
+        f"Match the named product's design, colors, and structure exactly — do NOT redesign or restyle.\n"
         f"(4) No text, labels, or watermarks.\n"
-        f"(5) Do NOT add any object, accessory, or detail that is not explicitly shown in the reference photos or listed in the JSON."
+        f"(5) The ONLY objects in the render are: the {n} named products + the room itself (walls, floor, openings). Nothing else."
     )
     if n_openings:
         constraints += f"\n(6) Render all {n_openings} opening(s) as simple, plain doors/windows in the correct walls — no extra hardware or decorative details."

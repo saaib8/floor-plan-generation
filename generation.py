@@ -760,7 +760,7 @@ def _batch_to_fp_payload(
     image_order = []
     seen_ids = {}
     for item in cleaned_products:
-        raw_id = item.get("category") or str(item.get("product_id", "")) or "product"
+        raw_id = item.get("product_name") or item.get("category") or str(item.get("product_id", "")) or "product"
         seen_ids[raw_id] = seen_ids.get(raw_id, 0) + 1
         pid = raw_id if seen_ids[raw_id] == 1 else f"{raw_id}_{seen_ids[raw_id]}"
         dims_obj = item.get("dimensions")
