@@ -20,6 +20,7 @@ class GenerationRequest(BaseModel):
     presets: Optional[Dict[str, Any]] = None
     room_dimensions: Optional[Dict[str, Any]] = None
     type: str = "floor"           # "floor" | "wall"
+    openings: Optional[List[Dict[str, Any]]] = []
 
 
 class GenerationStartResponse(BaseModel):
@@ -33,6 +34,7 @@ class GenerationStatusResponse(BaseModel):
     result_image: Optional[str] = None  # primary (isometric) image path
     result_images: Optional[Dict[str, str]] = None  # all views: {isometric, front, corner}
     reason: Optional[str] = None
+    validation_metrics: Optional[Dict[str, Any]] = None  # spatial validation stats when enabled
 
 
 class FloorPlanRequest(BaseModel):

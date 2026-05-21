@@ -32,20 +32,28 @@ def _build_scale_lines(batch_items: List[Dict], room_w_m: float, room_h_m: float
     for idx, item in enumerate(batch_items, start=1):
         hc = item.get("hex_color", "")
         pid = item.get("product_id", "")
-        dims_str = (item.get("dims") or item.get("dimensions") or "").strip()
         rotation = int(item.get("rotation") or 0)
         x_m = item.get("x_m")
         y_m = item.get("y_m")
 
+        # Parse dimensions — may be a dict (structured metres) or a string
+        dims_raw = item.get("dimensions")
+        if isinstance(dims_raw, dict):
+            dim1_m = float(dims_raw.get("width") or 0)
+            dim2_m = float(dims_raw.get("depth") or dims_raw.get("height") or dim1_m)
+            dims_str = f"{dim1_m} x {dim2_m}"
+        else:
+            dims_str = (item.get("dims") or (dims_raw if isinstance(dims_raw, str) else "") or "").strip()
+            dims_parsed = re.findall(r"[\d.]+", dims_str) if dims_str else []
+            dim1_m = float(dims_parsed[0]) if len(dims_parsed) >= 1 else 0
+            dim2_m = float(dims_parsed[1]) if len(dims_parsed) >= 2 else dim1_m
+
         scale_line = ""
-        dims_nums = re.findall(r"[\d.]+", dims_str) if dims_str else []
-        if len(dims_nums) >= 2 and room_w_m and room_h_m:
-            dim1_m = float(dims_nums[0])
-            dim2_m = float(dims_nums[1])
+        if dim1_m and dim2_m and room_w_m and room_h_m:
             if rotation in (90, 270):
-                prod_w_m, prod_h_m = dim1_m, dim2_m
-            else:
                 prod_w_m, prod_h_m = dim2_m, dim1_m
+            else:
+                prod_w_m, prod_h_m = dim1_m, dim2_m
             w_pct = prod_w_m / room_w_m * 100
             h_pct = prod_h_m / room_h_m * 100
             w_px = max(4, int(round(prod_w_m * ppm_x)))
@@ -318,7 +326,7 @@ def build_placement_prompt(
 ) -> str:
     if generation_type == "wall":
         return build_wall_placement_prompt(batch_items, room_dimensions, presets)
-    return  (batch_items, room_dimensions, presets)
+    return build_floor_placement_prompt(batch_items, room_dimensions, presets)
 
 
 def _build_derived_view_prompt(
@@ -374,6 +382,22 @@ def _build_derived_view_prompt(
             ref_lines.append(f"  IMAGE {i + 1} = product id={pid}")
     refs = "\n".join(ref_lines)
 
+    # Openings description for derived views
+    openings = payload.get("openings", [])
+    openings_line = ""
+    if openings:
+        o_parts = []
+        for o in openings:
+            otype = (o.get("type") or "opening").lower()
+            wall = (o.get("wall") or "?").upper()
+            ow = float(o.get("width") or 0)
+            o_parts.append(f"{otype} on {wall} wall ({ow:.1f}m wide)")
+        openings_line = (
+            "OPENINGS visible in IMAGE 1 that MUST appear in this view: "
+            + ", ".join(o_parts) + ". "
+            "Render each as a realistic architectural element (door frame/panel, window glass/frame)."
+        )
+
     n = len(payload.get("products", []))
     constraints = (
         f"HARD CONSTRAINTS: "
@@ -383,9 +407,150 @@ def _build_derived_view_prompt(
         f"(4) No text, labels, dimension lines, or watermarks."
     )
 
-    return "\n\n".join(filter(None, [appearance, view_line, refs, constraints])).strip() + (
+    return "\n\n".join(filter(None, [appearance, view_line, refs, openings_line, constraints])).strip() + (
         "\n\nOutput: one photorealistic render, no overlays, no on-image text."
     )
+
+
+def _compute_spatial_spec(payload: dict) -> str:
+    """Compute explicit wall-gap distances and asymmetry directives for each product.
+
+    Returns a prompt block like:
+        SPATIAL PLACEMENT CONSTRAINTS:
+        Room shape: wider than deep (9.0m wide x 6.0m deep, ratio 1.5:1), ...
+        seating (id=seating): gaps W=0.40m, E=7.50m, ...
+        ...
+        CRITICAL: Preserve exact spatial asymmetries above. ...
+
+    Returns "" if room data is missing so the caller can safely filter(None, ...).
+    """
+    room = payload.get("room", {})
+    room_w = float(room.get("width") or 0)
+    room_l = float(room.get("length") or 0)
+    if not room_w or not room_l:
+        return ""
+
+    products = payload.get("products", [])
+    if not products:
+        return ""
+
+    room_area = room_w * room_l
+
+    # Room shape description
+    if room_w > room_l * 1.05:
+        shape = "wider than deep"
+    elif room_l > room_w * 1.05:
+        shape = "deeper than wide"
+    else:
+        shape = "roughly square"
+
+    ratio = max(room_w, room_l) / min(room_w, room_l) if min(room_w, room_l) > 0 else 1.0
+    header = (
+        f"Room shape: {shape} ({room_w:.1f}m wide x {room_l:.1f}m deep, "
+        f"ratio {ratio:.1f}:1), total floor area {room_area:.1f} m2."
+    )
+
+    lines = ["SPATIAL PLACEMENT CONSTRAINTS:", header]
+    any_asymmetric = False
+    any_near_wall_gap = False
+    wall_touch_threshold = 0.15  # metres — considered "touching" a wall
+    near_wall_threshold = 1.0    # metres — close enough that models tend to snap
+
+    _WALL_NAMES = {
+        "w": "west (left)",
+        "e": "east (right)",
+        "n": "north (top/back)",
+        "s": "south (bottom/front)",
+    }
+
+    for p in products:
+        pid = p.get("id", "?")
+        cat = (p.get("category") or pid).replace("_", " ")
+        dims = p.get("dimensions", {})
+        pw = float(dims.get("width") or 0)
+        pd = float(dims.get("depth") or 0)
+        rot = int(p.get("rotation_y") or 0) % 360
+
+        eff_w, eff_d = (pd, pw) if rot in (90, 270) else (pw, pd)
+        half_w = eff_w / 2
+        half_d = eff_d / 2
+
+        pos = p.get("position", {})
+        cx = float(pos.get("x") or 0)
+        cy = float(pos.get("y") or 0)
+
+        # Wall gaps (from product edge to room boundary)
+        gap_w = max(0, cx - half_w)           # west gap
+        gap_e = max(0, room_w - cx - half_w)  # east gap
+        gap_n = max(0, cy - half_d)           # north gap
+        gap_s = max(0, room_l - cy - half_d)  # south gap
+
+        gaps = {"w": gap_w, "e": gap_e, "n": gap_n, "s": gap_s}
+
+        touching = []
+        near_wall_gaps = []  # walls that are close but NOT touching — danger zone
+        for key, gap in gaps.items():
+            if gap <= wall_touch_threshold:
+                touching.append(_WALL_NAMES[key])
+            elif gap <= near_wall_threshold:
+                near_wall_gaps.append((key, gap))
+
+        footprint_pct = (eff_w * eff_d) / room_area * 100 if room_area else 0
+        width_pct = eff_w / room_w * 100 if room_w else 0
+
+        line = (
+            f"  {cat} (id={pid}): gaps W={gap_w:.2f}m, E={gap_e:.2f}m, "
+            f"N={gap_n:.2f}m, S={gap_s:.2f}m."
+        )
+        lines.append(line)
+
+        if touching:
+            lines.append(
+                f"    AGAINST {', '.join(touching)} — keep it flush against "
+                f"{'these walls' if len(touching) > 1 else 'this wall'}. "
+                f"Footprint: {footprint_pct:.1f}% of floor, {width_pct:.0f}% of room width."
+            )
+
+        if near_wall_gaps:
+            any_near_wall_gap = True
+            for key, gap in near_wall_gaps:
+                wall_name = _WALL_NAMES[key]
+                lines.append(
+                    f"    GAP to {wall_name} wall = {gap:.2f}m — this gap is INTENTIONAL. "
+                    f"Do NOT push this product against the {wall_name} wall. "
+                    f"Maintain visible floor/space ({gap:.1f}m ≈ {gap / (room_l if key in ('n', 's') else room_w) * 100:.0f}% of room {'depth' if key in ('n', 's') else 'width'}) between the product edge and the wall."
+                )
+
+        if not touching and not near_wall_gaps:
+            lines.append(f"    Free-standing (well away from all walls). Footprint: {footprint_pct:.1f}% of floor, {width_pct:.0f}% of room width.")
+
+        # Asymmetry detection — left/right
+        if gap_w > 0.01 and gap_e > 0.01:
+            lr_ratio = max(gap_w, gap_e) / min(gap_w, gap_e) if min(gap_w, gap_e) > 0.01 else 999
+            if lr_ratio > 1.5:
+                closer_wall = "west" if gap_w < gap_e else "east"
+                lines.append(f"    Asymmetric left-right: closer to {closer_wall} wall -- do NOT center horizontally.")
+                any_asymmetric = True
+
+        # Asymmetry detection — front/back
+        if gap_n > 0.01 and gap_s > 0.01:
+            fb_ratio = max(gap_n, gap_s) / min(gap_n, gap_s) if min(gap_n, gap_s) > 0.01 else 999
+            if fb_ratio > 1.5:
+                closer_wall = "north" if gap_n < gap_s else "south"
+                lines.append(f"    Asymmetric front-back: closer to {closer_wall} wall -- do NOT center vertically.")
+                any_asymmetric = True
+
+    if any_asymmetric or any_near_wall_gap:
+        lines.append("")
+        lines.append(
+            "CRITICAL: Preserve exact spatial positioning above. Do NOT redistribute or\n"
+            "center products to look 'balanced'. Gaps are computed from user input.\n"
+            "If a product has a gap to a wall, that gap MUST appear in the render.\n"
+            "If a product is flush against a wall, it MUST stay flush.\n"
+            "The user placed every item deliberately — do not 'improve' the layout."
+        )
+
+    return "\n".join(lines)
 
 
 def build_floor_plan_prompt(
@@ -394,6 +559,7 @@ def build_floor_plan_prompt(
     has_guide: bool = False,
     view: str = "isometric",
     iso_base: bool = False,
+    correction_notes: str = "",
 ) -> str:
     """
     Strict separation of concerns:
@@ -445,9 +611,8 @@ def build_floor_plan_prompt(
 
     app += [
         "soft drop-shadows beneath each furniture piece",
-        "realistic material textures (fabric, wood, metal)",
         "no sticker or cutout look",
-        "editorial photography quality",
+        "clean architectural rendering — do NOT embellish or add decorative elements not in the reference photos",
     ]
 
     appearance = ", ".join(app) + "."
@@ -484,16 +649,39 @@ def build_floor_plan_prompt(
 
     if has_guide and img_order:
         ref_lines.append(
-            "IMAGE 1 is a colour-blob placement guide — each blob marks WHERE a product goes. "
-            "Match each blob colour to its product reference photo:"
+            "IMAGE 1 is a precise 2D floor plan guide showing the room at exact scale:"
+        )
+        ref_lines.append(
+            "- Dark grey border = room walls"
+        )
+        ref_lines.append(
+            "- Tan gaps in walls = doors; light blue gaps = windows"
+        )
+        ref_lines.append(
+            "- Coloured rectangles = exact product footprint positions (position, size, rotation all precise):"
         )
         for i, pid in enumerate(img_order, start=1):
-            hc = products_by_id.get(pid, {}).get("hex_color", "")
+            p_info = products_by_id.get(pid, {})
+            hc = p_info.get("hex_color", "")
+            dims = p_info.get("dimensions", {})
+            dw = dims.get("width") or 0
+            dd = dims.get("depth") or 0
             if hc:
-                ref_lines.append(f"  {hc} → IMAGE {i + 1}")
+                dim_str = f", {float(dw):.1f}\u00d7{float(dd):.1f}m" if dw and dd else ""
+                ref_lines.append(f"  {hc} ({pid}{dim_str}) \u2192 render using IMAGE {i + 1}")
         ref_lines.append(
-            "Replace every coloured blob with its photorealistic furniture piece. "
-            "Show bare floor everywhere else."
+            "- Beige background = empty floor; white outside = outside the room"
+        )
+        ref_lines.append(
+            "- Thick black edge on a rectangle = the FRONT of that product"
+        )
+        ref_lines.append("")
+        ref_lines.append(
+            "CRITICAL GUIDE RULES:\n"
+            "1. Each product's rendered footprint MUST align with its guide rectangle \u2014 same position, same size, same rotation.\n"
+            "2. If a rectangle is in the left third of the room in the guide, the product MUST be in the left third in the render.\n"
+            "3. Do NOT shift products to look more 'balanced' or 'centered' \u2014 the guide positions are the user's explicit intent.\n"
+            "4. Replace coloured rectangles with photorealistic furniture. Show bare floor everywhere else."
         )
     elif img_order:
         ref_lines.append("Product reference photos — render each item to exactly match its image:")
@@ -501,6 +689,34 @@ def build_floor_plan_prompt(
             ref_lines.append(f"  IMAGE {i + 1} = product id={pid}")
 
     refs = "\n".join(ref_lines)
+
+    # ── Product identity fidelity block ───────────────────────────────────────
+    identity_lines: List[str] = []
+    if img_order:
+        identity_lines.append(
+            "PRODUCT IDENTITY FIDELITY — EQUALLY IMPORTANT AS PLACEMENT ACCURACY:"
+        )
+        identity_lines.append(
+            "Each product reference photo (IMAGE 2, 3, …) is the EXACT product to render. "
+            "Copy its visual identity pixel-for-pixel:"
+        )
+        for i, pid in enumerate(img_order, start=1):
+            identity_lines.append(
+                f"  IMAGE {i + 1} ({pid}): Copy the EXACT design, upholstery, color, pattern, "
+                f"frame style, legs, and all visible details from this photo. "
+                f"Do NOT add, remove, or alter any element."
+            )
+        identity_lines.append(
+            "\nIDENTITY RULES:\n"
+            "- Do NOT add throws, blankets, cushions, pillows, or accessories not visible in the reference photo.\n"
+            "- Do NOT change the fabric color, pattern, or material from what the reference photo shows.\n"
+            "- Do NOT redesign the product shape, frame, or structure — copy it faithfully.\n"
+            "- Do NOT add extra hardware (handles, locks, knobs) to doors or furniture beyond what the reference shows.\n"
+            "- If the reference shows a plain bed, render a plain bed — no decorative throws or extra pillows.\n"
+            "- If the reference shows a simple door, render that exact door — no extra locks or panels.\n"
+            "- The reference photo is the SOLE source of truth for each product's appearance."
+        )
+    identity_block = "\n".join(identity_lines) if identity_lines else ""
 
     # ── Geometry block — raw JSON with percentage anchors added ──────────────
     room_w = float(room.get("width") or 0)
@@ -577,16 +793,43 @@ def build_floor_plan_prompt(
         + json.dumps(geometry, ensure_ascii=False, indent=2)
     )
 
+    # ── Spatial placement spec (wall gaps, asymmetry directives) ─────────────
+    spatial_spec = _compute_spatial_spec(payload)
+
+    # ── Openings spec (doors & windows) ────────────────────────────────────────
+    openings = payload.get("openings", [])
+    openings_spec = ""
+    if openings:
+        o_parts = []
+        for o in openings:
+            otype = (o.get("type") or "opening").lower()
+            wall = (o.get("wall") or "?").lower()
+            ow = float(o.get("width") or 0)
+            o_parts.append(f"{otype} on {wall} wall ({ow:.1f}m wide)")
+        openings_spec = (
+            f"DOORS & WINDOWS: Render these {len(openings)} opening(s): "
+            + ", ".join(o_parts) + ". "
+            "In IMAGE 1, tan gaps = doors, light blue gaps = windows. "
+            "Render each as a simple, plain architectural element — a basic door frame with a flat panel, "
+            "or a plain window with simple glass and frame. Do NOT add decorative details, extra locks, "
+            "handles, panels, or hardware beyond a single standard handle. Keep doors and windows minimal and clean."
+        )
+
     # ── Hard constraints ───────────────────────────────────────────────────────
     n = len(payload.get("products", []))
+    n_openings = len(openings)
     constraints = (
-        f"HARD CONSTRAINTS: "
-        f"(1) Exactly {n} furniture item(s) — no extra accessories, rugs, lamps, plants, or decor. "
-        f"(2) No architectural elements beyond those in the geometry JSON. "
-        f"(3) Render each product to exactly match its reference image — same shape, style, upholstery, finish. "
-        f"(4) No text, labels, dimension lines, or watermarks in the output."
+        f"HARD CONSTRAINTS — every rule is mandatory, violation = failure:\n"
+        f"(1) Exactly {n} furniture item(s) — no extra accessories, throws, blankets, rugs, lamps, plants, cushions, or decor not in the reference photos.\n"
+        f"(2) Only render architectural openings listed in the JSON openings array — no extra doors, windows, or skylights.\n"
+        f"(3) EXACT PRODUCT IDENTITY: Each product MUST be a faithful copy of its reference photo (IMAGE 2, 3, …). "
+        f"Same design, same colors, same structure, same details — do NOT redesign, restyle, or add elements.\n"
+        f"(4) No text, labels, or watermarks.\n"
+        f"(5) Do NOT add any object, accessory, or detail that is not explicitly shown in the reference photos or listed in the JSON."
     )
+    if n_openings:
+        constraints += f"\n(6) Render all {n_openings} opening(s) as simple, plain doors/windows in the correct walls — no extra hardware or decorative details."
 
-    return "\n\n".join(filter(None, [appearance, view_line, rotation_block, refs, geometry_block, constraints])).strip() + (
+    return "\n\n".join(filter(None, [appearance, view_line, rotation_block, refs, identity_block, geometry_block, spatial_spec, correction_notes, openings_spec, constraints])).strip() + (
         "\n\nOutput: one photorealistic render, no overlays, no on-image text."
     )

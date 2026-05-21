@@ -99,6 +99,7 @@ async def start_generation(request: GenerationRequest):
         request.presets,
         request.room_dimensions,
         request.type,
+        request.openings or [],
     )
 
     return GenerationStartResponse(gen_id=gen_id, status="processing")
@@ -142,14 +143,30 @@ def _save_view_results(gen_id: str, results: dict) -> dict:
     return paths
 
 
+def _build_validation_metrics(attempt_metrics: list) -> dict:
+    """Build a validation_metrics dict from the attempt metrics list."""
+    if not attempt_metrics:
+        return {"enabled": False}
+    final = attempt_metrics[-1]
+    return {
+        "enabled": True,
+        "total_attempts": len(attempt_metrics),
+        "final_score": final.get("best_score", 0),
+        "passed": final.get("passed", False),
+        "attempts": attempt_metrics,
+    }
+
+
 def _run_floor_plan_generation(gen_id: str, payload: dict):
     size = payload.pop("size", "1024x1024")
     try:
-        results = generate_floor_plan(payload, size=size)
+        results, attempt_metrics = generate_floor_plan(payload, size=size)
         paths = _save_view_results(gen_id, results)
         _generations[gen_id]["status"] = "success"
         _generations[gen_id]["result_image"] = paths.get("isometric") or next(iter(paths.values()))
         _generations[gen_id]["result_images"] = paths
+        if attempt_metrics:
+            _generations[gen_id]["validation_metrics"] = _build_validation_metrics(attempt_metrics)
         logger.info("Floor plan generation %s completed: %s", gen_id, list(paths.keys()))
     except Exception as e:
         logger.error("Floor plan generation %s failed: %s", gen_id, e, exc_info=True)
@@ -157,7 +174,7 @@ def _run_floor_plan_generation(gen_id: str, payload: dict):
         _generations[gen_id]["reason"] = str(e)
 
 
-def _run_generation(gen_id, highlight_path, products, presets, room_dimensions, generation_type):
+def _run_generation(gen_id, highlight_path, products, presets, room_dimensions, generation_type, openings=None):
     try:
         results = generate_product_placement(
             base_image_url=highlight_path,
@@ -166,8 +183,17 @@ def _run_generation(gen_id, highlight_path, products, presets, room_dimensions, 
             room_dimensions=room_dimensions,
             presets=presets,
             generation_type=generation_type,
+            openings=openings or [],
         )
-        if isinstance(results, dict):
+        # Floor flow returns (dict, metrics); wall flow returns raw bytes
+        if isinstance(results, tuple):
+            view_dict, attempt_metrics = results
+            paths = _save_view_results(gen_id, view_dict)
+            _generations[gen_id]["result_image"] = paths.get("isometric") or next(iter(paths.values()))
+            _generations[gen_id]["result_images"] = paths
+            if attempt_metrics:
+                _generations[gen_id]["validation_metrics"] = _build_validation_metrics(attempt_metrics)
+        elif isinstance(results, dict):
             paths = _save_view_results(gen_id, results)
             _generations[gen_id]["result_image"] = paths.get("isometric") or next(iter(paths.values()))
             _generations[gen_id]["result_images"] = paths

@@ -324,6 +324,52 @@ canvas {
 }
 .sample-img-use:hover { background: var(--accent); color: #fff; }
 
+/* Openings UI */
+.opening-add-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 14px;
+  background: var(--accent-light);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.opening-add-btn:hover { background: var(--accent); color: #fff; }
+.opening-add-btn.active { background: var(--accent); color: #fff; box-shadow: 0 0 0 2px rgba(74,124,89,0.3); }
+
+.opening-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  margin-bottom: 4px;
+  font-size: 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+.opening-item .opening-icon { font-size: 14px; flex-shrink: 0; }
+.opening-item .opening-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.opening-item .width-input {
+  width: 48px;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 10px;
+  text-align: center;
+  background: var(--surface);
+  color: var(--text);
+}
+.opening-item .width-input:focus { border-color: var(--accent); outline: none; }
+.opening-item .remove-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--text-muted); font-size: 14px; line-height: 1;
+  padding: 0 2px; flex-shrink: 0;
+}
+.opening-item .remove-btn:hover { color: var(--danger); }
+
 /* Generate button */
 .gen-section { padding: 12px; }
 #btn-generate {
