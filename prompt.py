@@ -540,15 +540,51 @@ def _compute_spatial_spec(payload: dict) -> str:
                 lines.append(f"    Asymmetric front-back: closer to {closer_wall} wall -- do NOT center vertically.")
                 any_asymmetric = True
 
-    if any_asymmetric or any_near_wall_gap:
-        lines.append("")
-        lines.append(
-            "CRITICAL: Preserve exact spatial positioning above. Do NOT redistribute or\n"
-            "center products to look 'balanced'. Gaps are computed from user input.\n"
-            "If a product has a gap to a wall, that gap MUST appear in the render.\n"
-            "If a product is flush against a wall, it MUST stay flush.\n"
-            "The user placed every item deliberately — do not 'improve' the layout."
-        )
+    # ── Gap-to-openings (doors/windows) for products on the same wall ──────
+    openings = payload.get("openings", [])
+    if openings:
+        for p in products:
+            pid = p.get("id", "?")
+            pos = p.get("position", {})
+            cx = float(pos.get("x") or 0)
+            cy = float(pos.get("y") or 0)
+            dims = p.get("dimensions", {})
+            pw = float(dims.get("width") or 0)
+            pd_val = float(dims.get("depth") or 0)
+            rot = int(p.get("rotation_y") or 0) % 360
+            eff_w, eff_d = (pd_val, pw) if rot in (90, 270) else (pw, pd_val)
+
+            for o in openings:
+                o_wall = (o.get("wall") or "").lower()
+                o_pos = float(o.get("position_from_left") or 0)
+                o_width = float(o.get("width") or 0)
+                o_type = (o.get("type") or "opening").lower()
+                o_center = o_pos + o_width / 2
+
+                # Compute distance between product edge and opening center
+                dist = None
+                axis = ""
+                if o_wall in ("north", "south"):
+                    dist = abs(cx - o_center)
+                    axis = "horizontally"
+                elif o_wall in ("west", "east"):
+                    dist = abs(cy - o_center)
+                    axis = "vertically"
+
+                if dist is not None and dist < max(room_w, room_l):
+                    lines.append(
+                        f"    {pid} is {dist:.2f}m {axis} from {o_type} on {o_wall} wall — preserve this gap exactly."
+                    )
+
+    lines.append("")
+    lines.append(
+        "CRITICAL: Preserve exact spatial positioning above. Do NOT redistribute or\n"
+        "center products to look 'balanced'. Gaps are computed from user input.\n"
+        "If a product has a gap to a wall, that gap MUST appear in the render.\n"
+        "If a product has a gap to a window or door, that gap MUST be preserved.\n"
+        "If a product is flush against a wall, it MUST stay flush.\n"
+        "The user placed every item deliberately — do not 'improve' the layout."
+    )
 
     return "\n".join(lines)
 
@@ -658,30 +694,36 @@ def build_floor_plan_prompt(
             "- Tan gaps in walls = doors; light blue gaps = windows"
         )
         ref_lines.append(
-            "- Coloured rectangles = exact product footprint positions (position, size, rotation all precise):"
+            "- Neutral gray rectangles = exact product footprint positions (position, size, rotation all precise)"
+        )
+        ref_lines.append(
+            "- Each rectangle has a CIRCLED NUMBER in its top-left corner identifying which product goes there:"
         )
         for i, pid in enumerate(img_order, start=1):
             p_info = products_by_id.get(pid, {})
-            hc = p_info.get("hex_color", "")
             dims = p_info.get("dimensions", {})
             dw = dims.get("width") or 0
             dd = dims.get("depth") or 0
-            if hc:
-                dim_str = f", {float(dw):.1f}\u00d7{float(dd):.1f}m" if dw and dd else ""
-                ref_lines.append(f"  {hc} ({pid}{dim_str}) \u2192 render using IMAGE {i + 1}")
+            dim_str = f", {float(dw):.1f}\u00d7{float(dd):.1f}m" if dw and dd else ""
+            ref_lines.append(f"  Rectangle \u24ea{i} = \"{pid}\"{dim_str} \u2192 render using IMAGE {i + 1}")
         ref_lines.append(
             "- Beige background = empty floor; white outside = outside the room"
         )
         ref_lines.append(
             "- Thick black edge on a rectangle = the FRONT of that product"
         )
+        ref_lines.append(
+            "- The gray color of the rectangles is MEANINGLESS — it is NOT a color hint for the product. "
+            "Get each product's color/material ONLY from its reference photo (IMAGE 2, 3, …)."
+        )
         ref_lines.append("")
         ref_lines.append(
             "CRITICAL GUIDE RULES:\n"
-            "1. Each product's rendered footprint MUST align with its guide rectangle \u2014 same position, same size, same rotation.\n"
+            "1. Each product's rendered footprint MUST align with its numbered guide rectangle \u2014 same position, same size, same rotation.\n"
             "2. If a rectangle is in the left third of the room in the guide, the product MUST be in the left third in the render.\n"
             "3. Do NOT shift products to look more 'balanced' or 'centered' \u2014 the guide positions are the user's explicit intent.\n"
-            "4. Replace coloured rectangles with photorealistic furniture. Show bare floor everywhere else."
+            "4. Replace gray rectangles with photorealistic furniture. Show bare floor everywhere else.\n"
+            "5. If the same product appears multiple times (e.g. two armchairs), render ALL instances with IDENTICAL appearance — same color, same material, same design. Only position/rotation differs."
         )
     elif img_order:
         ref_lines.append("Product reference photos — render each item to exactly match its image:")
@@ -707,6 +749,19 @@ def build_floor_plan_prompt(
                 f"material, frame, and structure. IGNORE any other furniture, chairs, accessories, "
                 f"or objects visible in the same photo — they are staging props, not products to render."
             )
+        # Detect duplicates — same base product used multiple times
+        base_names = {}
+        for pid in img_order:
+            base = pid.rstrip("_0123456789")  # "Armchair_2" → "Armchair"
+            base_names.setdefault(base, []).append(pid)
+        duplicate_lines = []
+        for base, pids in base_names.items():
+            if len(pids) > 1:
+                duplicate_lines.append(
+                    f"- {', '.join(pids)} are the SAME product — render ALL of them with IDENTICAL "
+                    f"appearance (same color, same fabric, same design). Only their position/rotation differs."
+                )
+
         identity_lines.append(
             "\nIDENTITY RULES:\n"
             "- From each reference photo, render ONLY the single named product. All other objects in the photo are staging — discard them.\n"
@@ -716,6 +771,9 @@ def build_floor_plan_prompt(
             "- Do NOT add extra hardware (handles, locks, knobs) to doors or furniture beyond what the reference shows.\n"
             "- The reference photo defines ONLY the appearance of the named product — nothing else from the photo should appear in the render."
         )
+        if duplicate_lines:
+            identity_lines.append("\nDUPLICATE PRODUCTS — must look identical:")
+            identity_lines.extend(duplicate_lines)
     identity_block = "\n".join(identity_lines) if identity_lines else ""
 
     # ── Geometry block — raw JSON with percentage anchors added ──────────────
@@ -755,23 +813,50 @@ def build_floor_plan_prompt(
         dims = p.get("dimensions", {})
         w = float(dims.get("width") or 0)
         d = float(dims.get("depth") or 0)
+        is_square = abs(w - d) < 0.1
+        # Compute effective footprint after rotation
+        if rot in (90, 270):
+            eff_w, eff_d = d, w  # width/depth swap
+        else:
+            eff_w, eff_d = w, d
+        footprint = f"footprint in room: {eff_w:.1f}m LEFT↔RIGHT × {eff_d:.1f}m TOP↔BOTTOM"
+
         if rot == 0:
-            rotation_lines.append(f"  {cat}: 0° — use reference photo orientation as-is.")
-        elif rot == 90:
-            long_axis = "width" if d > w else "depth"
             rotation_lines.append(
-                f"  {cat}: 90° CW — its longer dimension runs LEFT↔RIGHT; front faces EAST."
+                f"  {pid}: 0° — use reference photo orientation as-is. Front faces NORTH. {footprint}."
             )
+        elif rot == 90:
+            if is_square:
+                rotation_lines.append(
+                    f"  {pid}: 90° CW — front faces EAST. "
+                    f"Product is square ({w:.1f}×{d:.1f}m), rotate it so its front/seat side points RIGHT. {footprint}."
+                )
+            else:
+                long_dir = "LEFT↔RIGHT" if eff_w > eff_d else "TOP↔BOTTOM"
+                rotation_lines.append(
+                    f"  {pid}: 90° CW — front faces EAST. "
+                    f"Longer dimension ({max(eff_w,eff_d):.1f}m) runs {long_dir}. {footprint}."
+                )
         elif rot == 180:
             rotation_lines.append(
-                f"  {cat}: 180° — completely flipped from reference photo; front faces SOUTH."
+                f"  {pid}: 180° — completely flipped from reference photo. Front faces SOUTH. {footprint}."
             )
         elif rot == 270:
-            rotation_lines.append(
-                f"  {cat}: 270° CW — its longer dimension runs LEFT↔RIGHT; front faces WEST."
-            )
+            if is_square:
+                rotation_lines.append(
+                    f"  {pid}: 270° CW — front faces WEST. "
+                    f"Product is square ({w:.1f}×{d:.1f}m), rotate it so its front/seat side points LEFT. {footprint}."
+                )
+            else:
+                long_dir = "LEFT↔RIGHT" if eff_w > eff_d else "TOP↔BOTTOM"
+                rotation_lines.append(
+                    f"  {pid}: 270° CW — front faces WEST. "
+                    f"Longer dimension ({max(eff_w,eff_d):.1f}m) runs {long_dir}. {footprint}."
+                )
         else:
-            rotation_lines.append(f"  {cat}: {rot}° CW from reference photo; front faces {facing}.")
+            rotation_lines.append(
+                f"  {pid}: {rot}° CW from reference photo. Front faces {facing}. {footprint}."
+            )
 
     rotation_block = (
         "PRODUCT ROTATIONS — apply exactly before placing in the room:\n"

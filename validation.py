@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 VALIDATION_ENABLED = os.getenv("VALIDATION_ENABLED", "true").lower() in ("true", "1", "yes")
 VALIDATION_MODEL = os.getenv("VALIDATION_MODEL", "gpt-4o")
 VALIDATION_MAX_ATTEMPTS = int(os.getenv("VALIDATION_MAX_ATTEMPTS", "3"))
-VALIDATION_SCORE_THRESHOLD = float(os.getenv("VALIDATION_SCORE_THRESHOLD", "0.7"))
+VALIDATION_SCORE_THRESHOLD = float(os.getenv("VALIDATION_SCORE_THRESHOLD", "0.75"))
 VALIDATION_CANDIDATES_PER_ATTEMPT = int(os.getenv("VALIDATION_CANDIDATES_PER_ATTEMPT", "1"))
 VALIDATION_TIMEOUT = int(os.getenv("VALIDATION_TIMEOUT", "60"))
 
@@ -88,18 +88,28 @@ def _build_validation_prompt(payload: dict) -> str:
         pos = p.get("position", {})
         dims = p.get("dimensions", {})
         rot = int(p.get("rotation_y") or 0) % 360
-        x_pct = round(float(pos.get("x", 0)) / room_w * 100, 1) if room_w else 0
-        y_pct = round(float(pos.get("y", 0)) / room_l * 100, 1) if room_l else 0
+        cx = float(pos.get("x", 0))
+        cy = float(pos.get("y", 0))
+        x_pct = round(cx / room_w * 100, 1) if room_w else 0
+        y_pct = round(cy / room_l * 100, 1) if room_l else 0
+        pw = float(dims.get("width") or 0)
+        pd = float(dims.get("depth") or 0)
+        eff_w, eff_d = (pd, pw) if rot in (90, 270) else (pw, pd)
+        gap_left = round(cx - eff_w / 2, 2)
+        gap_right = round(room_w - cx - eff_w / 2, 2)
+        gap_top = round(cy - eff_d / 2, 2)
+        gap_bottom = round(room_l - cy - eff_d / 2, 2)
         product_specs.append(
             f"  - id={pid}: center at ({x_pct}% from left, {y_pct}% from top), "
-            f"size {dims.get('width', '?')}x{dims.get('depth', '?')}m, rotation {rot} deg"
+            f"size {pw}x{pd}m, rotation {rot} deg. "
+            f"Expected gaps: left={gap_left}m, right={gap_right}m, top={gap_top}m, bottom={gap_bottom}m"
         )
 
     products_block = "\n".join(product_specs)
 
-    return f"""You are a spatial accuracy judge for interior design renders.
+    return f"""You are a strict spatial accuracy judge for interior design renders.
 
-IMAGE 1 is a 2D floor plan guide showing exact furniture positions as colored rectangles.
+IMAGE 1 is a 2D floor plan guide showing exact furniture positions as numbered gray rectangles.
 IMAGE 2 is a generated 3D isometric render that should match those positions.
 
 Room: {room_w:.1f}m wide x {room_l:.1f}m deep.
@@ -107,15 +117,16 @@ Room: {room_w:.1f}m wide x {room_l:.1f}m deep.
 Expected product positions (percentages from room edges):
 {products_block}
 
-For each product, assess:
-1. POSITION: Is the product center within 15% of its expected location? (Compare guide rectangle position to rendered furniture position)
-2. SIZE: Is the product approximately the right relative size? (within 30% of expected)
+For each product, assess STRICTLY:
+1. POSITION: Is the product center within 10% of its expected location? Pay special attention to gaps between furniture and walls/windows — if the guide shows a large gap, the render must show the same proportional gap.
+2. SIZE: Is the product approximately the right relative size? (within 25% of expected)
 3. ROTATION: Does the product face the correct direction?
 
 Also check:
 - Are there any MISSING products (in guide but not in render)?
-- Are there any EXTRA products (in render but not in guide)?
+- Are there any EXTRA products (in render but not in guide)? Count carefully — staging props from reference photos should NOT appear.
 - Does the room shape match (walls, proportions)?
+- Are gaps between furniture and walls preserved? If a product has a 2m gap to a wall in the guide, the render must show approximately the same gap.
 
 Respond with ONLY valid JSON in this exact format:
 {{

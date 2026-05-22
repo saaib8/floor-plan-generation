@@ -309,19 +309,26 @@ def _make_blank_canvas(size: str = "1024x1024") -> bytes:
 
 # ── Floor plan guide generation ─────────────────────────────────────────────
 
-_GUIDE_COLORS = [
-    "#E05C5C", "#3DA8C6", "#4BAF7A", "#D4A017",
-    "#9B59B6", "#E67E22", "#16A085", "#C0392B",
+_GUIDE_GRAYS = [
+    "#A0A0A0", "#787878", "#B8B8B8", "#909090",
+    "#686868", "#C8C8C8", "#808080", "#989898",
 ]
 
 
 def _assign_guide_colors(products: list) -> list:
-    """Return a copy of products with hex_color auto-assigned where missing."""
+    """Return a copy of products with a neutral gray auto-assigned where missing.
+
+    Uses neutral grays instead of saturated colors so guide rectangle colors
+    don't bleed into the rendered product appearance.
+    """
     result = []
     for i, p in enumerate(products):
         p = dict(p)
         if not p.get("hex_color"):
-            p["hex_color"] = _GUIDE_COLORS[i % len(_GUIDE_COLORS)]
+            p["hex_color"] = _GUIDE_GRAYS[i % len(_GUIDE_GRAYS)]
+        # Always override with neutral gray — even if frontend sent a color,
+        # we don't want saturated guide colors influencing the render.
+        p["hex_color"] = _GUIDE_GRAYS[i % len(_GUIDE_GRAYS)]
         result.append(p)
     return result
 
@@ -437,11 +444,12 @@ def _make_floor_plan_guide(payload: dict, canvas_size: int = 1024) -> bytes:
     label_font = _get_font(13)
     dim_font = _get_font(11)
     room_label_font = _get_font(14)
+    number_font = _get_font(18)
 
     _FACING_MAP = {0: "N", 90: "E", 180: "S", 270: "W"}
 
-    # Product footprints — coloured rectangles at exact position and size
-    for p in payload.get("products", []):
+    # Product footprints — neutral gray rectangles with number labels
+    for prod_idx, p in enumerate(payload.get("products", [])):
         dims = p.get("dimensions", {})
         dim_w = float(dims.get("width") or dims.get("diameter") or 0)
         dim_d = float(dims.get("depth") or dims.get("diameter") or dim_w)
@@ -522,6 +530,24 @@ def _make_floor_plan_guide(payload: dict, canvas_size: int = 1024) -> bytes:
                 (x0, y0 - pct_th - 2), pct_label,
                 fill=(80, 80, 80), font=pct_font,
             )
+
+        # ── Circled number label for product-to-image mapping ──
+        num_label = str(prod_idx + 1)
+        num_bbox = draw.textbbox((0, 0), num_label, font=number_font)
+        num_tw = num_bbox[2] - num_bbox[0]
+        num_th = num_bbox[3] - num_bbox[1]
+        circle_r = max(num_tw, num_th) // 2 + 4
+        circle_cx = x0 + circle_r + 3
+        circle_cy = y0 + circle_r + 3
+        draw.ellipse(
+            [circle_cx - circle_r, circle_cy - circle_r,
+             circle_cx + circle_r, circle_cy + circle_r],
+            fill=(255, 255, 255), outline=(0, 0, 0), width=2,
+        )
+        draw.text(
+            (circle_cx - num_tw / 2, circle_cy - num_th / 2),
+            num_label, fill=(0, 0, 0), font=number_font,
+        )
 
     # ── Room dimension labels ──
     # Width label along the bottom edge
