@@ -581,8 +581,8 @@ def _compute_spatial_spec(payload: dict) -> str:
         "CRITICAL: Preserve exact spatial positioning above. Do NOT redistribute or\n"
         "center products to look 'balanced'. Gaps are computed from user input.\n"
         "If a product has a gap to a wall, that gap MUST appear in the render.\n"
-        "If a product has a gap to a window or door, that gap MUST be preserved.\n"
-        "If a product is flush against a wall, it MUST stay flush.\n"
+        + ("If a product has a gap to a window or door, that gap MUST be preserved.\n" if openings else "")
+        + "If a product is flush against a wall, it MUST stay flush.\n"
         "The user placed every item deliberately — do not 'improve' the layout."
     )
 
@@ -616,11 +616,18 @@ def build_floor_plan_prompt(
     lighting = payload.get("lighting", {})
 
     # ── English appearance paragraph — NO geometry, NO coordinates ───────────
+    openings = payload.get("openings", [])
+    has_openings = len(openings) > 0
+    has_windows = any((o.get("type") or "").lower() == "window" for o in openings)
+
     app: List[str] = ["Ultra-realistic architectural visualization"]
 
     lt = (lighting.get("type") or "natural_daylight").replace("_", " ")
     if "natural" in lt.lower() or "daylight" in lt.lower():
-        app.append("warm natural daylight, soft ambient light from windows")
+        if has_windows:
+            app.append("warm natural daylight, soft ambient light from windows")
+        else:
+            app.append("warm soft ambient light, evenly lit interior")
     elif lt.strip():
         app.append(lt)
 
@@ -690,9 +697,14 @@ def build_floor_plan_prompt(
         ref_lines.append(
             "- Dark grey border = room walls"
         )
-        ref_lines.append(
-            "- Tan gaps in walls = doors; light blue gaps = windows"
-        )
+        if has_openings:
+            ref_lines.append(
+                "- Tan gaps in walls = doors; light blue gaps = windows"
+            )
+        else:
+            ref_lines.append(
+                "- All four walls are SOLID with NO gaps — there are NO doors or windows in this room"
+            )
         ref_lines.append(
             "- Neutral gray rectangles = exact product footprint positions (position, size, rotation all precise)"
         )
@@ -907,11 +919,21 @@ def build_floor_plan_prompt(
         f"HARD CONSTRAINTS — every rule is mandatory, violation = failure:\n"
         f"(1) Exactly {n} furniture item(s) in total — no more, no fewer. Do NOT add chairs, stools, rugs, lamps, plants, "
         f"cushions, throws, blankets, or any object from a reference photo's background/staging.\n"
-        f"(2) Only render architectural openings listed in the JSON openings array — no extra doors, windows, or skylights.\n"
+    )
+    if n_openings:
+        constraints += (
+            f"(2) Only render the {n_openings} architectural opening(s) listed in the JSON openings array — no extra doors, windows, or skylights.\n"
+        )
+    else:
+        constraints += (
+            f"(2) This room has ZERO openings — do NOT render any doors, windows, or skylights. "
+            f"All four walls must be completely SOLID with no gaps, no glass, no frames, no openings of any kind.\n"
+        )
+    constraints += (
         f"(3) PRODUCT IDENTITY: Copy ONLY the named product from each reference photo. Ignore staging props visible in the photo. "
         f"Match the named product's design, colors, and structure exactly — do NOT redesign or restyle.\n"
         f"(4) No text, labels, or watermarks.\n"
-        f"(5) The ONLY objects in the render are: the {n} named products + the room itself (walls, floor, openings). Nothing else."
+        f"(5) The ONLY objects in the render are: the {n} named products + the room itself (walls, floor). Nothing else."
     )
     if n_openings:
         constraints += f"\n(6) Render all {n_openings} opening(s) as simple, plain doors/windows in the correct walls — no extra hardware or decorative details."
