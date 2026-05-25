@@ -38,6 +38,21 @@ class GenerationStatusResponse(BaseModel):
     validation_metrics: Optional[Dict[str, Any]] = None  # spatial validation stats when enabled
 
 
+class WallImageUrl(BaseModel):
+    url: str                           # server-relative path, e.g. "/outputs/xxx_elevation.png"
+    wall_id: Optional[int] = None
+    label: Optional[str] = None
+    width_m: Optional[float] = None
+    height_m: Optional[float] = None
+
+
+class ComposeRequest(BaseModel):
+    floor_image_url: str               # server-relative path, e.g. "/outputs/xxx_isometric.png"
+    wall_image_urls: List[WallImageUrl]
+    room_dimensions: Optional[Dict[str, Any]] = None
+    presets: Optional[Dict[str, Any]] = None
+
+
 class FloorPlanRequest(BaseModel):
     scene_id: Optional[str] = None
     unit: str = "cm"

@@ -5,19 +5,20 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-from prompt import build_placement_prompt, build_floor_plan_prompt
+from prompt import build_floor_plan_prompt, build_wall_plan_prompt, build_composition_prompt
 from validation import (
     VALIDATION_ENABLED,
     VALIDATION_MAX_ATTEMPTS,
     VALIDATION_CANDIDATES_PER_ATTEMPT,
     ValidationResult,
     validate_spatial_accuracy,
+    validate_wall_accuracy,
     build_correction_notes,
     pick_best_candidate,
 )
@@ -25,8 +26,7 @@ from validation import (
 logger = logging.getLogger(__name__)
 
 MODEL = "gpt-image-2"
-COLOR_TOL = 45
-MIN_AREA = 300
+_DEFAULT_WALL_H = 2.8  # metres
 
 
 # ── URL / path utilities ────────────────────────────────────────────────────
@@ -183,93 +183,6 @@ def _openai_product_placement_edit(
         raise RuntimeError(f"OpenAI API error {response.status_code}: {error_body}")
     payload = response.json()
     return base64.b64decode(payload["data"][0]["b64_json"])
-
-
-# ── Color mask utilities ────────────────────────────────────────────────────
-
-def extract_connected_components(binary: np.ndarray) -> List[np.ndarray]:
-    H, W = binary.shape
-    visited = np.zeros((H, W), dtype=bool)
-    comps = []
-
-    for y in range(H):
-        for x in range(W):
-            if not binary[y, x] or visited[y, x]:
-                continue
-            stack = [(y, x)]
-            visited[y, x] = True
-            coords = []
-            while stack:
-                cy, cx = stack.pop()
-                coords.append((cy, cx))
-                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                    if 0 <= ny < H and 0 <= nx < W and binary[ny, nx] and not visited[ny, nx]:
-                        visited[ny, nx] = True
-                        stack.append((ny, nx))
-            m = np.zeros((H, W), dtype=bool)
-            ys, xs = zip(*coords)
-            m[np.array(ys), np.array(xs)] = True
-            comps.append(m)
-
-    return comps
-
-
-def mask_bool_to_L(mask: np.ndarray) -> Image.Image:
-    return Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
-
-
-def guide_to_color_masks(
-    guide_img: Image.Image,
-    target_colors_rgb: Dict[str, Tuple[int, int, int]],
-    tol: int = COLOR_TOL,
-    min_area: int = MIN_AREA,
-) -> Dict[str, np.ndarray]:
-    rgb = np.array(guide_img.convert("RGB"))
-    out: Dict[str, np.ndarray] = {}
-
-    for hex_color, (r, g, b) in target_colors_rgb.items():
-        binary = (
-            (np.abs(rgb[..., 0] - r) <= tol) &
-            (np.abs(rgb[..., 1] - g) <= tol) &
-            (np.abs(rgb[..., 2] - b) <= tol)
-        )
-        comps = extract_connected_components(binary)
-        comps = [m for m in comps if int(m.sum()) >= min_area]
-        if not comps:
-            continue
-        merged = np.zeros(binary.shape, dtype=bool)
-        for m in comps:
-            merged |= m
-        out[hex_color] = merged
-
-    return out
-
-
-def lock_all_except_color_regions(
-    prev_base: Image.Image,
-    gen_img: Image.Image,
-    color_masks: Dict[str, np.ndarray],
-    editable_hex_colors: List[str],
-) -> Image.Image:
-    prev_base = prev_base.convert("RGBA")
-    gen_img = gen_img.convert("RGBA")
-    if prev_base.size != gen_img.size:
-        gen_img = gen_img.resize(prev_base.size, Image.Resampling.LANCZOS)
-
-    out = gen_img.copy()
-    editable_set = {normalize_hex(c) for c in editable_hex_colors}
-
-    for hex_color, m in color_masks.items():
-        if normalize_hex(hex_color) in editable_set:
-            continue
-        out.paste(prev_base, (0, 0), mask_bool_to_L(m))
-
-    union = np.zeros(next(iter(color_masks.values())).shape, dtype=bool)
-    for m in color_masks.values():
-        union |= m
-    out.paste(prev_base, (0, 0), mask_bool_to_L(~union))
-
-    return out
 
 
 # ── Floor plan generation (text → image, no base image required) ─────────────
@@ -729,6 +642,89 @@ def _generate_views_sequential(
     return results, attempt_metrics
 
 
+def _generate_wall_elevation_with_validation(
+    payload: dict,
+    image_bytes_list: List[bytes],
+    guide_bytes: bytes,
+    size: str = "1024x1024",
+    image_order: Optional[List[str]] = None,
+    has_guide: bool = False,
+) -> Tuple[bytes, List[Dict]]:
+    """Generate wall elevation with spatial validation and retry loop.
+
+    Mirrors _generate_isometric_with_validation:
+    - Up to VALIDATION_MAX_ATTEMPTS retries
+    - VALIDATION_CANDIDATES_PER_ATTEMPT candidates per attempt (parallel if >1)
+    - GPT-4o Vision scores each candidate via validate_wall_accuracy
+    - Correction notes injected into prompt on each retry
+    - Best candidate across all attempts is returned
+    """
+    attempt_metrics: List[Dict] = []
+    best_elevation: Optional[bytes] = None
+    best_validation: Optional[ValidationResult] = None
+    correction_notes = ""
+
+    max_attempts = VALIDATION_MAX_ATTEMPTS if VALIDATION_ENABLED else 1
+    candidates_per = VALIDATION_CANDIDATES_PER_ATTEMPT if VALIDATION_ENABLED else 1
+
+    for attempt in range(1, max_attempts + 1):
+        logger.info("Wall elevation attempt %d/%d", attempt, max_attempts)
+
+        wall_prompt = build_wall_plan_prompt(
+            payload,
+            image_order=image_order,
+            has_guide=has_guide,
+            correction_notes=correction_notes,
+        )
+        logger.info("Wall prompt %d chars (attempt %d)", len(wall_prompt), attempt)
+
+        def _gen_one(_idx: int) -> bytes:
+            return _openai_product_placement_edit(wall_prompt, image_bytes_list, size=size)
+
+        if candidates_per > 1:
+            with ThreadPoolExecutor(max_workers=min(candidates_per, 4)) as pool:
+                futures = [pool.submit(_gen_one, i) for i in range(candidates_per)]
+                candidate_bytes_list = [f.result() for f in futures]
+        else:
+            candidate_bytes_list = [_gen_one(0)]
+
+        candidates_with_scores: List[Tuple[bytes, ValidationResult]] = []
+        for idx, cand_bytes in enumerate(candidate_bytes_list):
+            if VALIDATION_ENABLED:
+                vr = validate_wall_accuracy(cand_bytes, guide_bytes, payload)
+                logger.info(
+                    "Wall candidate %d score=%.3f passed=%s openings_ok=%s",
+                    idx + 1, vr.score, vr.passed, vr.openings_correct,
+                )
+            else:
+                vr = ValidationResult(score=1.0, passed=True)
+            candidates_with_scores.append((cand_bytes, vr))
+
+        attempt_best_bytes, attempt_best_vr = pick_best_candidate(candidates_with_scores)
+
+        attempt_metrics.append({
+            "attempt": attempt,
+            "candidates": candidates_per,
+            "best_score": attempt_best_vr.score,
+            "passed": attempt_best_vr.passed,
+            "details": attempt_best_vr.to_dict(),
+        })
+
+        if best_validation is None or attempt_best_vr.score > best_validation.score:
+            best_elevation = attempt_best_bytes
+            best_validation = attempt_best_vr
+
+        if attempt_best_vr.passed:
+            logger.info("Wall validation passed on attempt %d (score=%.3f)", attempt, attempt_best_vr.score)
+            break
+
+        if attempt < max_attempts:
+            correction_notes = build_correction_notes(attempt_best_vr)
+            logger.info("Wall validation failed (score=%.3f), retrying with corrections", attempt_best_vr.score)
+
+    return best_elevation, attempt_metrics
+
+
 def generate_floor_plan(payload: dict, size: str = "1024x1024") -> Tuple[Dict[str, bytes], List[Dict]]:
     """
     Generate isometric, front, and corner renders from a structured JSON payload.
@@ -848,6 +844,293 @@ def _batch_to_fp_payload(
     return payload, image_order
 
 
+# ── Wall elevation guide + payload ──────────────────────────────────────────
+
+def _make_wall_elevation_guide(payload: dict, canvas_size: int = 1024) -> bytes:
+    """Draw a 2D front-elevation guide for a wall surface at exact scale.
+
+    IMAGE 1 for wall generation: wall rectangle, openings (doors/windows),
+    product footprints as numbered gray rectangles — mirrors _make_floor_plan_guide.
+    """
+    wall = payload.get("wall", {})
+    wall_w = float(wall.get("width") or 0)
+    wall_h = float(wall.get("height") or _DEFAULT_WALL_H)
+    if not wall_w or not wall_h:
+        return _make_blank_canvas(f"{canvas_size}x{canvas_size}")
+
+    margin = 60
+    usable = canvas_size - 2 * margin
+    ppm = usable / max(wall_w, wall_h)
+
+    ww_px = int(round(wall_w * ppm))
+    wh_px = int(round(wall_h * ppm))
+    ox = (canvas_size - ww_px) // 2
+    oy = (canvas_size - wh_px) // 2  # oy = ceiling edge; oy+wh_px = floor edge
+
+    img = Image.new("RGB", (canvas_size, canvas_size), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # Wall surface background + subtle plaster lines
+    draw.rectangle([ox, oy, ox + ww_px, oy + wh_px], fill=(245, 242, 238))
+    draw.line([(ox, oy + wh_px), (ox + ww_px, oy + wh_px)], fill=(180, 170, 160), width=3)  # floor
+    for y_line in range(oy + 40, oy + wh_px, 40):
+        draw.line([(ox, y_line), (ox + ww_px, y_line)], fill=(235, 230, 225), width=1)
+
+    # Thin diagram outline only — NOT a thick border that the AI might render as molding
+    draw.rectangle([ox, oy, ox + ww_px, oy + wh_px], outline=(160, 155, 148), width=2)
+
+    label_font = _get_font(13)
+    dim_font = _get_font(11)
+    number_font = _get_font(18)
+    opening_label_font = _get_font(11)
+
+    # Openings (position_from_left = left edge in metres; y from floor)
+    for o in payload.get("openings", []):
+        otype = (o.get("type") or "").lower()
+        pos_left = float(o.get("position_from_left") or 0)
+        ow = float(o.get("width") or 0)
+        oh = float(o.get("height") or (2.2 if otype == "door" else 0.9))
+        sill = float(o.get("sill_height") or 0)
+
+        x0_px = ox + int(round(pos_left * ppm))
+        x1_px = ox + int(round((pos_left + ow) * ppm))
+
+        if otype == "door":
+            # Door from floor up to oh metres
+            y0_px = oy + wh_px - int(round(oh * ppm))
+            y1_px = oy + wh_px
+            gap_fill, outline_color = (210, 180, 140), (180, 140, 90)
+            lbl, text_color = "DOOR", (100, 70, 30)
+        else:
+            # Window from sill to sill+oh
+            y0_px = oy + wh_px - int(round((sill + oh) * ppm))
+            y1_px = oy + wh_px - int(round(sill * ppm))
+            gap_fill, outline_color = (140, 185, 220), (100, 150, 200)
+            lbl, text_color = "WINDOW", (30, 70, 130)
+
+        draw.rectangle([x0_px, y0_px, x1_px, y1_px], fill=gap_fill, outline=outline_color, width=2)
+        bbox = draw.textbbox((0, 0), lbl, font=opening_label_font)
+        lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(((x0_px + x1_px) / 2 - lw / 2, (y0_px + y1_px) / 2 - lh / 2),
+                  lbl, fill=text_color, font=opening_label_font)
+
+    # Product footprints — neutral gray rectangles with number labels
+    for prod_idx, p in enumerate(payload.get("products", [])):
+        dims = p.get("dimensions", {})
+        dim_w = float(dims.get("width") or 1.0)
+        dim_h = float(dims.get("height") or dims.get("depth") or 0.85)
+        rot = int(p.get("rotation_y") or 0) % 360
+        # Swap w/h when product is rotated 90°/270° (tipped sideways on the wall)
+        draw_w, draw_h = (dim_h, dim_w) if rot in (90, 270) else (dim_w, dim_h)
+        pos_d = p.get("position", {})
+        cx_m = float(pos_d.get("x") or 0)       # centre from left edge
+        cy_m = float(pos_d.get("y") or 0)        # centre height from floor
+
+        cx_px = ox + cx_m * ppm
+        cy_px = oy + wh_px - cy_m * ppm          # canvas: floor is oy+wh_px
+        hw = draw_w * ppm / 2
+        hh = draw_h * ppm / 2
+
+        x0 = max(float(ox), cx_px - hw)
+        y0 = max(float(oy), cy_px - hh)
+        x1 = min(float(ox + ww_px), cx_px + hw)
+        y1 = min(float(oy + wh_px), cy_px + hh)
+
+        try:
+            r, g, b = hex_to_rgb(p.get("hex_color") or "#888888")
+        except Exception:
+            r, g, b = 136, 136, 136
+
+        draw.rectangle([x0, y0, x1, y1], fill=(r, g, b), outline=(0, 0, 0), width=2)
+
+        luma = 0.299 * r + 0.587 * g + 0.114 * b
+        text_color = (255, 255, 255) if luma < 140 else (0, 0, 0)
+
+        pid = p.get("id", "")
+        if pid:
+            bbox = draw.textbbox((0, 0), pid, font=label_font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if tw < (x1 - x0) - 4 and th < (y1 - y0) - 4:
+                draw.text(((x0 + x1) / 2 - tw / 2, (y0 + y1) / 2 - th / 2 - 7),
+                          pid, fill=text_color, font=label_font)
+
+        dim_text = f"{draw_w:.1f}×{draw_h:.1f}m" + (f" [{rot}°]" if rot else "")
+        bbox_d = draw.textbbox((0, 0), dim_text, font=dim_font)
+        dtw, dth = bbox_d[2] - bbox_d[0], bbox_d[3] - bbox_d[1]
+        if dtw < (x1 - x0) - 4 and dth < (y1 - y0) - 4:
+            draw.text(((x0 + x1) / 2 - dtw / 2, (y0 + y1) / 2 - dth / 2 + 7),
+                      dim_text, fill=text_color, font=dim_font)
+
+        # Circled number
+        num_label = str(prod_idx + 1)
+        num_bbox = draw.textbbox((0, 0), num_label, font=number_font)
+        num_tw = num_bbox[2] - num_bbox[0]
+        num_th = num_bbox[3] - num_bbox[1]
+        circle_r = max(num_tw, num_th) // 2 + 4
+        circle_cx = x0 + circle_r + 3
+        circle_cy = y0 + circle_r + 3
+        draw.ellipse(
+            [circle_cx - circle_r, circle_cy - circle_r,
+             circle_cx + circle_r, circle_cy + circle_r],
+            fill=(255, 255, 255), outline=(0, 0, 0), width=2,
+        )
+        draw.text((circle_cx - num_tw / 2, circle_cy - num_th / 2),
+                  num_label, fill=(0, 0, 0), font=number_font)
+
+        # Vertical dashed center-line through product (x-anchor visual)
+        dash_len, gap_len = 6, 4
+        y_cur = float(oy)
+        while y_cur < oy + wh_px:
+            y_end = min(y_cur + dash_len, float(oy + wh_px))
+            draw.line([(cx_px, y_cur), (cx_px, y_end)], fill=(80, 80, 80), width=1)
+            y_cur += dash_len + gap_len
+
+        # X-position label below the wall border (ruler annotation)
+        # Stagger alternating rows so overlapping labels don't collide
+        x_pct = round(cx_m / wall_w * 100) if wall_w else 0
+        x_label = f"x={cx_m:.2f}m ({x_pct}%)"
+        bbox_xl = draw.textbbox((0, 0), x_label, font=dim_font)
+        xl_w = bbox_xl[2] - bbox_xl[0]
+        row_offset = (prod_idx % 2) * 16
+        label_y = oy + wh_px + 8 + row_offset
+        draw.text((cx_px - xl_w / 2, label_y), x_label, fill=(80, 40, 160), font=dim_font)
+
+    # Dimension labels
+    room_label_font = _get_font(14)
+    width_text = f"{wall_w:.1f}m"
+    bbox_w = draw.textbbox((0, 0), width_text, font=room_label_font)
+    wtw = bbox_w[2] - bbox_w[0]
+    draw.text((ox + ww_px / 2 - wtw / 2, oy + wh_px + 6),
+              width_text, fill=(40, 40, 40), font=room_label_font)
+
+    height_text = f"{wall_h:.1f}m"
+    bbox_h = draw.textbbox((0, 0), height_text, font=room_label_font)
+    htw, hth = bbox_h[2] - bbox_h[0], bbox_h[3] - bbox_h[1]
+    draw.text((ox - htw - 8, oy + wh_px / 2 - hth / 2),
+              height_text, fill=(40, 40, 40), font=room_label_font)
+
+    return pil_to_png_bytes(img)
+
+
+def _batch_to_wall_payload(
+    cleaned_products: List[Dict],
+    room_dimensions: Dict,
+    presets: Dict,
+    openings: Optional[List[Dict]] = None,
+) -> tuple:
+    """Convert Surface Editor batch items into a wall-elevation payload.
+
+    Mirrors _batch_to_fp_payload but for front-facing wall renders.
+    y_m from the canvas is distance from the TOP (ceiling); we convert to
+    distance from the BOTTOM (floor) so the coordinate system matches the
+    wall elevation guide (y=0 at floor, y=wall_h at ceiling).
+    """
+    unit = room_dimensions.get("unit", "m")
+    wall_w = float(room_dimensions.get("width") or 0)
+    wall_h = float(room_dimensions.get("height") or _DEFAULT_WALL_H)
+
+    pr = presets or {}
+    wall_color = pr.get("wall_color", "#F3EFE8")
+    lighting_type = pr.get("lighting", "natural_daylight")
+
+    products = []
+    image_order = []
+    seen_ids: Dict[str, int] = {}
+
+    for item in cleaned_products:
+        raw_id = (
+            item.get("product_name")
+            or item.get("category")
+            or str(item.get("product_id", ""))
+            or "product"
+        )
+        seen_ids[raw_id] = seen_ids.get(raw_id, 0) + 1
+        pid = raw_id if seen_ids[raw_id] == 1 else f"{raw_id}_{seen_ids[raw_id]}"
+
+        dims_obj = item.get("dimensions")
+        if isinstance(dims_obj, dict):
+            dim_w = float(dims_obj.get("width") or 1.0)
+            dim_h = float(dims_obj.get("height") or dims_obj.get("depth") or dim_w)
+        else:
+            dims_str = (
+                item.get("dims")
+                or (dims_obj if isinstance(dims_obj, str) else "")
+                or ""
+            ).strip()
+            dims_nums = re.findall(r"[\d.]+", dims_str) if dims_str else []
+            dim_w = float(dims_nums[0]) if len(dims_nums) >= 1 else 1.0
+            dim_h = float(dims_nums[1]) if len(dims_nums) >= 2 else dim_w
+
+        x_m = item.get("x_m")
+        # Canvas y_m = distance from ceiling (top of canvas).
+        # Convert to y_from_floor = distance from floor.
+        y_m_from_ceiling = item.get("y_m")
+        if y_m_from_ceiling is not None:
+            y_from_floor = round(wall_h - float(y_m_from_ceiling), 3)
+        else:
+            y_from_floor = round(dim_h / 2, 3)  # rest on floor by default
+
+        if x_m is None:
+            x_m = round(wall_w / 2, 3)
+
+        entry = {
+            "id": pid,
+            "hex_color": item.get("hex_color", ""),
+            "image_url": item.get("image_url", ""),
+            "dimensions": {"width": dim_w, "height": dim_h},
+            "position": {"x": round(float(x_m), 3), "y": y_from_floor},
+            "rotation_y": item.get("rotation") or 0,
+        }
+        if item.get("category"):
+            entry["category"] = item["category"]
+        products.append(entry)
+        image_order.append(pid)
+
+    payload = {
+        "unit": unit,
+        "wall": {"width": wall_w, "height": wall_h, "color": wall_color},
+        "openings": openings or [],
+        "products": products,
+        "lighting": {"type": lighting_type},
+    }
+    return payload, image_order
+
+
+def _validate_and_clamp_wall_layout(payload: dict) -> dict:
+    """Clamp every product position so its footprint stays inside the wall."""
+    wall = payload.get("wall", {})
+    wall_w = float(wall.get("width") or 0)
+    wall_h = float(wall.get("height") or _DEFAULT_WALL_H)
+    if not wall_w or not wall_h:
+        return payload
+
+    for p in payload.get("products", []):
+        dims = p.get("dimensions", {})
+        pw = float(dims.get("width") or 0)
+        ph = float(dims.get("height") or 0)
+        rot = int(p.get("rotation_y") or 0) % 360
+        eff_w, eff_h = (ph, pw) if rot in (90, 270) else (pw, ph)
+        half_w, half_h = eff_w / 2, eff_h / 2
+
+        pos = p.get("position", {})
+        x = float(pos.get("x") or 0)
+        y = float(pos.get("y") or 0)
+
+        clamped_x = max(half_w, min(wall_w - half_w, x))
+        clamped_y = max(half_h, min(wall_h - half_h, y))
+
+        if abs(clamped_x - x) > 0.001 or abs(clamped_y - y) > 0.001:
+            logger.warning(
+                "Wall layout: product %s clamped from (%.3f, %.3f) to (%.3f, %.3f) "
+                "to stay within wall %.1f × %.1f",
+                p.get("id", "?"), x, y, clamped_x, clamped_y, wall_w, wall_h,
+            )
+            pos["x"] = round(clamped_x, 3)
+            pos["y"] = round(clamped_y, 3)
+
+    return payload
+
+
 def _validate_and_clamp_layout(payload: dict) -> dict:
     """Clamp every product position so its footprint stays inside the room.
 
@@ -893,17 +1176,18 @@ def _validate_and_clamp_layout(payload: dict) -> dict:
 # ── Main generation function ────────────────────────────────────────────────
 
 def generate_product_placement(
-    base_image_url: str,
-    guide_image_url: str,
     products: List[Dict],
     room_dimensions: Optional[Dict] = None,
     presets: Optional[Dict] = None,
     generation_type: str = "floor",
-    color_tol: int = 60,
-    min_area: int = 200,
-    batch_size: int = 20,
     openings: Optional[List[Dict]] = None,
-) -> bytes:
+) -> Tuple[Dict[str, bytes], List[Dict]]:
+    """Generate product placement renders for floor or wall surfaces.
+
+    Returns (view_images_dict, attempt_metrics).
+    Floor: views = {"isometric", "front", "corner"}
+    Wall:  views = {"elevation"}
+    """
     if not products:
         raise ValueError("products list is empty.")
 
@@ -921,88 +1205,90 @@ def generate_product_placement(
         cleaned["image_url"] = img_url
         cleaned_products.append(cleaned)
 
-    # ── Floor type: JSON geometry + appearance prompt, 3 views in parallel ──────
+    # ── Floor: programmatic guide + JSON geometry, 3 views ───────────────────
     if generation_type == "floor":
         fp_payload, image_order = _batch_to_fp_payload(
             cleaned_products, room_dimensions or {}, presets or {},
             openings=openings or [],
         )
         _validate_and_clamp_layout(fp_payload)
+        fp_payload["products"] = _assign_guide_colors(fp_payload.get("products", []))
         logger.info("Surface Editor floor: %d product(s)", len(cleaned_products))
         guide_bytes = _make_floor_plan_guide(fp_payload)
         image_bytes_list = [guide_bytes]
         for p in cleaned_products:
             image_bytes_list.append(_sanitize_image_bytes(download_bytes(p["image_url"])))
-        results, attempt_metrics = _generate_views_sequential(
+        return _generate_views_sequential(
             fp_payload, image_bytes_list,
             image_order=image_order, has_guide=True,
             guide_bytes=guide_bytes,
         )
-        return results, attempt_metrics
 
-    # ── Wall type: original guide-blob batch approach ─────────────────────────
-    guide_bytes = download_bytes(guide_image_url)
-    base_bytes = download_bytes(base_image_url)
-    base_img = pil_from_bytes(base_bytes)
-    guide_img = pil_from_bytes(guide_bytes)
-
-    unique_hex = sorted({p["hex_color"] for p in cleaned_products})
-    target_colors_rgb = {hc: hex_to_rgb(hc) for hc in unique_hex}
-
-    color_masks = guide_to_color_masks(
-        guide_img=guide_img,
-        target_colors_rgb=target_colors_rgb,
-        tol=color_tol,
-        min_area=min_area,
+    # ── Wall: programmatic guide + JSON geometry + validation retry loop ─────
+    wall_payload, image_order = _batch_to_wall_payload(
+        cleaned_products, room_dimensions or {}, presets or {},
+        openings=openings or [],
     )
-    for hc in [hc for hc in unique_hex if hc not in color_masks]:
-        try:
-            extra = guide_to_color_masks(
-                guide_img=guide_img,
-                target_colors_rgb={hc: hex_to_rgb(hc)},
-                tol=color_tol + 20,
-                min_area=max(10, min_area - 50),
-            )
-            if hc in extra:
-                color_masks[hc] = extra[hc]
-        except Exception:
-            pass
+    _validate_and_clamp_wall_layout(wall_payload)
+    wall_payload["products"] = _assign_guide_colors(wall_payload.get("products", []))
+    logger.info("Surface Editor wall: %d product(s)", len(cleaned_products))
+    guide_bytes = _make_wall_elevation_guide(wall_payload)
+    image_bytes_list = [guide_bytes]
+    for p in cleaned_products:
+        image_bytes_list.append(_sanitize_image_bytes(download_bytes(p["image_url"])))
 
-    current_base = base_img
-    i = 0
-    while i < len(cleaned_products):
-        batch = cleaned_products[i:i + batch_size]
-        batch_items, batch_urls = [], []
-        for p in batch:
-            hc = p["hex_color"]
-            if hc not in color_masks:
-                logger.warning("No color mask for hex %s — skipping product %s", hc, p.get("product_id"))
-                continue
-            batch_items.append({
-                "hex_color": hc,
-                "product_id": p.get("product_id"),
-                "dims": p.get("dims") or p.get("dimensions"),
-                "rotation": p.get("rotation") or 0,
-                "image_url": p.get("image_url"),
-                "x_m": p.get("x_m"),
-                "y_m": p.get("y_m"),
-            })
-            batch_urls.append(p["image_url"])
+    if VALIDATION_ENABLED:
+        elevation_bytes, attempt_metrics = _generate_wall_elevation_with_validation(
+            wall_payload, image_bytes_list,
+            guide_bytes=guide_bytes,
+            image_order=image_order,
+            has_guide=True,
+        )
+    else:
+        prompt = build_wall_plan_prompt(wall_payload, image_order=image_order, has_guide=True)
+        logger.info("Wall elevation prompt %d chars (no validation)", len(prompt))
+        elevation_bytes = _openai_product_placement_edit(prompt, image_bytes_list)
+        attempt_metrics = []
 
-        if batch_items:
-            prompt = build_placement_prompt(
-                batch_items=batch_items,
-                room_dimensions=room_dimensions,
-                presets=presets,
-                generation_type="wall",
-            )
-            image_bytes_list = [pil_to_png_bytes(current_base), guide_bytes]
-            for url in batch_urls:
-                image_bytes_list.append(_sanitize_image_bytes(download_bytes(url)))
-            current_base = pil_from_bytes(
-                _openai_product_placement_edit(prompt, image_bytes_list)
-            )
+    return {"elevation": elevation_bytes}, attempt_metrics
 
-        i += len(batch)
 
-    return pil_to_png_bytes(current_base)
+def generate_room_composition(
+    floor_image_url: str,
+    wall_image_urls: List[Dict],
+    room_dimensions: Optional[Dict] = None,
+    presets: Optional[Dict] = None,
+    base_dir: Optional[str] = None,
+) -> bytes:
+    """Compose a final isometric room view from a floor image and one or more wall images.
+
+    floor_image_url: server-relative path like "/outputs/xxx_isometric.png"
+    wall_image_urls: list of {url, label, width_m, height_m}
+    base_dir: filesystem root to resolve server-relative URLs (defaults to generation.py parent)
+    """
+    root = Path(base_dir) if base_dir else Path(__file__).parent
+
+    def _resolve(url: str) -> bytes:
+        path = root / url.lstrip("/")
+        if path.exists():
+            return _sanitize_image_bytes(path.read_bytes())
+        return _sanitize_image_bytes(download_bytes(url))
+
+    floor_bytes = _resolve(floor_image_url)
+
+    wall_labels: List[str] = []
+    wall_bytes_list: List[bytes] = []
+    for wi in wall_image_urls:
+        wall_bytes_list.append(_resolve(wi["url"]))
+        wall_labels.append(wi.get("label") or f"Wall {wi.get('wall_id', '?')}")
+
+    image_bytes_list = [floor_bytes] + wall_bytes_list
+
+    prompt = build_composition_prompt(
+        room_dimensions=room_dimensions or {},
+        wall_labels=wall_labels,
+        presets=presets or {},
+        n_walls=len(wall_bytes_list),
+    )
+    logger.info("Composition prompt %d chars, %d images", len(prompt), len(image_bytes_list))
+    return _openai_product_placement_edit(prompt, image_bytes_list)

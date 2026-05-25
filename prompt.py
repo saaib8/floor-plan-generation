@@ -98,7 +98,8 @@ def _build_scale_lines(batch_items: List[Dict], room_w_m: float, room_h_m: float
     return lines, total_prod_area, room_area_m2
 
 
-def build_floor_placement_prompt(
+# ── Legacy batch-placement helpers (kept only for reference, unused) ──────────
+def _build_floor_placement_prompt_legacy(
     batch_items: List[Dict],
     room_dimensions: Optional[Dict] = None,
     presets: Optional[Dict] = None,
@@ -217,7 +218,7 @@ Output: a single photorealistic realistic-looking top bird-eye 3D isometric rend
 """.strip()
 
 
-def build_wall_placement_prompt(
+def _build_wall_placement_prompt_legacy(
     batch_items: List[Dict],
     room_dimensions: Optional[Dict] = None,
     presets: Optional[Dict] = None,
@@ -316,17 +317,6 @@ No sticker or cutout look. Colored guide marks must vanish — show natural wall
 
 Output: a single photorealistic front-facing wall elevation render, no overlays, no on-image text.
 """.strip()
-
-
-def build_placement_prompt(
-    batch_items: List[Dict],
-    room_dimensions: Optional[Dict] = None,
-    presets: Optional[Dict] = None,
-    generation_type: str = "floor",
-) -> str:
-    if generation_type == "wall":
-        return build_wall_placement_prompt(batch_items, room_dimensions, presets)
-    return build_floor_placement_prompt(batch_items, room_dimensions, presets)
 
 
 def _build_derived_view_prompt(
@@ -941,3 +931,303 @@ def build_floor_plan_prompt(
     return "\n\n".join(filter(None, [appearance, view_line, rotation_block, refs, identity_block, geometry_block, spatial_spec, correction_notes, openings_spec, constraints])).strip() + (
         "\n\nOutput: one photorealistic render, no overlays, no on-image text."
     )
+
+
+def build_wall_plan_prompt(
+    payload: dict,
+    image_order: Optional[List[str]] = None,
+    has_guide: bool = False,
+    correction_notes: str = "",
+) -> str:
+    """
+    Prompt for wall elevation renders.
+    Strict separation of concerns (mirrors build_floor_plan_prompt):
+      JSON data  → all geometry (positions, dimensions, openings)
+      English    → appearance only (materials, lighting, render quality)
+
+    image_order: product IDs in the order their photos are attached (IMAGE 2, 3, …).
+    has_guide:   True when IMAGE 1 is a programmatically-drawn wall elevation guide.
+    """
+    wall = payload.get("wall", {})
+    lighting = payload.get("lighting", {})
+
+    # ── English appearance — NO geometry ─────────────────────────────────────
+    app: List[str] = ["Ultra-realistic architectural visualization"]
+
+    lt = (lighting.get("type") or "natural_daylight").replace("_", " ")
+    if "natural" in lt.lower() or "daylight" in lt.lower():
+        app.append("warm natural daylight, soft ambient light from windows")
+    elif lt.strip():
+        app.append(lt)
+
+    wall_color = wall.get("color", "")
+    if wall_color:
+        app.append(f"wall painted {wall_color}")
+
+    for p in payload.get("products", []):
+        mat = p.get("material")
+        if isinstance(mat, dict):
+            app.extend(str(v) for v in mat.values() if v)
+        elif isinstance(mat, str) and mat:
+            app.append(mat)
+
+    app += [
+        "soft drop-shadows beneath each piece",
+        "realistic material textures (fabric, wood, metal)",
+        "no sticker or cutout look",
+        "editorial photography quality",
+    ]
+    appearance = ", ".join(app) + "."
+
+    # ── View ─────────────────────────────────────────────────────────────────
+    view_line = (
+        "Front-facing wall elevation — camera at eye level (1.2 m height) perpendicular "
+        "to the wall, looking straight at it. Full wall width and height in frame. "
+        "Show a strip of floor in front. "
+        "Floor-standing furniture rests on the floor in front of the wall; "
+        "wall-mounted items (art, TV, shelves) are mounted on the wall surface."
+    )
+
+    # ── Per-product rotation summary ─────────────────────────────────────────
+    rotation_lines: List[str] = []
+    for p in payload.get("products", []):
+        rot = int(p.get("rotation_y") or 0) % 360
+        if rot == 0:
+            continue
+        pid = p.get("id", "?")
+        dims = p.get("dimensions", {})
+        w = float(dims.get("width") or 0)
+        h = float(dims.get("height") or 0)
+        eff_w = h if rot in (90, 270) else w
+        eff_h = w if rot in (90, 270) else h
+        rotation_lines.append(
+            f"  {pid}: {rot}° CW — product is rotated {rot}° clockwise as viewed from the front. "
+            f"Visible footprint on wall: {eff_w:.1f}m wide × {eff_h:.1f}m tall."
+        )
+    rotation_block = (
+        "PRODUCT ROTATIONS — apply exactly before placing on the wall:\n"
+        + "\n".join(rotation_lines)
+    ) if rotation_lines else ""
+
+    # ── Image references ──────────────────────────────────────────────────────
+    img_order = image_order or []
+    products_by_id = {p["id"]: p for p in payload.get("products", [])}
+    ref_lines: List[str] = []
+
+    if has_guide and img_order:
+        ref_lines.append("IMAGE 1 is a precise 2D wall elevation guide drawn at exact physical scale:")
+        ref_lines.append("- Dark grey border = wall boundary (exact width × height)")
+        ref_lines.append("- Tan rectangles at bottom edge = doors; light blue rectangles = windows")
+        ref_lines.append("- GRAY rectangles = exact product footprint positions (different gray shades per product)")
+        ref_lines.append("- Each gray rectangle has a CIRCLED NUMBER in its top-left corner identifying which product goes there")
+        ref_lines.append("- Thin vertical DASHED LINE through each rectangle = the exact horizontal center of that product")
+        ref_lines.append("- Purple label below each dashed line (e.g. 'x=1.65m 30%') = horizontal center distance from LEFT wall edge")
+        ref_lines.append("")
+        ref_lines.append("PRODUCT PLACEMENT — exact x-position per item (these are binding, not suggestions):")
+        wall_w2 = float(wall.get("width") or 1)
+        wall_h2 = float(wall.get("height") or 2.8)
+        for i, pid in enumerate(img_order, start=1):
+            p_info = products_by_id.get(pid, {})
+            dims = p_info.get("dimensions", {})
+            pos = p_info.get("position", {})
+            dw = float(dims.get("width") or 0)
+            dh = float(dims.get("height") or dims.get("depth") or 0)
+            px = float(pos.get("x") or 0)
+            py = float(pos.get("y") or 0)
+            x_pct = round(px / wall_w2 * 100, 0) if wall_w2 else 0
+            y_pct = round(py / wall_h2 * 100, 0) if wall_h2 else 0
+            side = "LEFT third" if x_pct < 34 else ("CENTER" if x_pct < 67 else "RIGHT third")
+            pos_str = (
+                f"center at x={px:.2f}m from LEFT edge ({x_pct:.0f}% — {side} of wall), "
+                f"y={py:.2f}m from floor ({y_pct:.0f}% up the wall)"
+            ) if px or py else ""
+            dim_str = f"{dw:.1f}×{dh:.1f}m" if dw and dh else ""
+            ref_lines.append(
+                f"  ⓪{i} \"{pid}\" [{dim_str}] — {pos_str} — render using IMAGE {i + 1}"
+            )
+        ref_lines.append("")
+        ref_lines.append(
+            "CRITICAL POSITIONING RULES — violation = failure:\n"
+            "1. Each product's LEFT-RIGHT position MUST match the dashed center line in the guide and the x-value listed above.\n"
+            "2. Do NOT cluster products near windows or doors — place them at the exact x-position shown, even if that leaves them isolated.\n"
+            "3. Do NOT move products to create a 'balanced' composition — the user's explicit placement is the only valid arrangement.\n"
+            "4. Replace gray guide rectangles with photorealistic products. Show bare wall everywhere else.\n"
+            "5. NO FRAME — The thin outline around the guide image is a diagram boundary marker ONLY. "
+            "Do NOT render any dark frame, border, molding, trim, or outline around the wall edges in the output. "
+            "The wall surface must extend cleanly to the edges of the frame with NO visible border — "
+            "just smooth plaster/paint all the way to the image boundary."
+        )
+    elif img_order:
+        ref_lines.append("Product reference photos — render each to exactly match its image:")
+        for i, pid in enumerate(img_order, start=1):
+            ref_lines.append(f"  IMAGE {i + 1} = product id={pid}")
+
+    refs = "\n".join(ref_lines)
+
+    # ── Product identity block ────────────────────────────────────────────────
+    identity_lines: List[str] = []
+    if img_order:
+        identity_lines.append("PRODUCT IDENTITY FIDELITY:")
+        identity_lines.append(
+            "Reference photos may contain OTHER objects (chairs, accessories, staging props). "
+            "IGNORE THEM. From each photo, extract and render ONLY the single named product."
+        )
+        for i, pid in enumerate(img_order, start=1):
+            identity_lines.append(
+                f"  IMAGE {i + 1} → render ONLY the \"{pid}\" — copy its exact design, shape, color, "
+                f"material, frame, and structure. IGNORE all other objects in the photo."
+            )
+        identity_lines.append(
+            "\nIDENTITY RULES:\n"
+            "- Do NOT change the fabric color, pattern, or material of the named product.\n"
+            "- Do NOT redesign the product shape, frame, or structure — copy faithfully.\n"
+            "- The reference photo defines ONLY the appearance of the named product."
+        )
+    identity_block = "\n".join(identity_lines) if identity_lines else ""
+
+    # ── Geometry block (raw JSON + percentage cross-checks) ───────────────────
+    wall_w = float(wall.get("width") or 0)
+    wall_h = float(wall.get("height") or 2.8)
+
+    clean_products = []
+    for p in payload.get("products", []):
+        cp = {k: v for k, v in p.items() if k not in ("material", "image_url", "hex_color")}
+        pos = cp.get("position", {})
+        if pos and wall_w and wall_h:
+            x = float(pos.get("x") or 0)
+            y = float(pos.get("y") or 0)  # y = centre height from floor
+            cp["position"] = {
+                **pos,
+                "x_pct": round(x / wall_w * 100, 1),
+                "y_from_floor_pct": round(y / wall_h * 100, 1),
+            }
+        clean_products.append(cp)
+
+    geometry = {
+        "unit": payload.get("unit", "m"),
+        "wall": wall,
+        "openings": payload.get("openings", []),
+        "products": clean_products,
+    }
+    geometry_block = (
+        "Wall geometry — positions and dimensions are exact; render precisely.\n"
+        "Coordinate system: origin (0,0) = bottom-left corner of wall (floor level, left edge). "
+        "x increases rightward (0 = left edge, wall.width = right edge). "
+        "y increases upward (0 = floor, wall.height = ceiling). "
+        "position.x/y = centre of the product footprint.\n"
+        + json.dumps(geometry, ensure_ascii=False, indent=2)
+    )
+
+    # ── Openings spec ─────────────────────────────────────────────────────────
+    openings = payload.get("openings", [])
+    openings_spec = ""
+    if openings:
+        o_parts = []
+        for o in openings:
+            otype = (o.get("type") or "opening").lower()
+            ow = float(o.get("width") or 0)
+            oh = float(o.get("height") or (2.2 if otype == "door" else 0.9))
+            pos_left = float(o.get("position_from_left") or 0)
+            if otype == "door":
+                o_parts.append(
+                    f"door at x={pos_left:.2f}m from left edge, {ow:.1f}m wide × {oh:.1f}m tall, at floor level"
+                )
+            else:
+                sill = float(o.get("sill_height") or 1.2)
+                o_parts.append(
+                    f"window at x={pos_left:.2f}m from left edge, {ow:.1f}m wide × {oh:.1f}m tall, sill at {sill:.1f}m"
+                )
+        openings_spec = (
+            f"DOORS & WINDOWS: Render these {len(openings)} opening(s) on this wall: "
+            + "; ".join(o_parts) + ". "
+            "Render each as a simple, clean architectural element — "
+            "a plain door frame with flat panel and single handle, "
+            "or a plain window with glass and simple frame. No extra decorative hardware."
+        )
+
+    # ── Hard constraints ──────────────────────────────────────────────────────
+    n = len(payload.get("products", []))
+    n_openings = len(openings)
+    constraints = (
+        f"HARD CONSTRAINTS — every rule is mandatory, violation = failure:\n"
+        f"(1) Exactly {n} product item(s) — no extra accessories, rugs, lamps, or decor not listed.\n"
+        f"(2) PRODUCT IDENTITY: copy ONLY the named product from each reference photo; "
+        f"ignore all staging props visible in the same photo.\n"
+        f"(3) No text, labels, dimension lines, or watermarks.\n"
+        f"(4) Wall boundaries must match the guide exactly — no extra openings or structural features.\n"
+        f"(5) Front-facing elevation view only — no top-down, no fisheye, no angled perspective.\n"
+        f"(6) NO WALL FRAME — do NOT render any dark border, molding, trim, or outline around the wall "
+        f"edges. The wall is a flat interior surface that extends to the image boundary; "
+        f"there is no physical frame around it."
+    )
+    if n_openings:
+        constraints += (
+            f"\n(6) Render all {n_openings} opening(s) as simple, plain doors/windows — "
+            "no extra hardware or decorative panels beyond what the guide shows."
+        )
+
+    return "\n\n".join(filter(None, [
+        appearance, view_line, rotation_block, refs, identity_block,
+        geometry_block, correction_notes, openings_spec, constraints,
+    ])).strip() + "\n\nOutput: one photorealistic front-facing wall elevation render, no overlays, no on-image text."
+
+
+def build_composition_prompt(
+    room_dimensions: Optional[Dict] = None,
+    wall_labels: Optional[List[str]] = None,
+    presets: Optional[Dict] = None,
+    n_walls: int = 0,
+) -> str:
+    """Prompt for the final isometric room composition from floor + wall reference images."""
+    rd = room_dimensions or {}
+    w = float(rd.get("width") or 0)
+    d = float(rd.get("height") or rd.get("depth") or 0)
+    wall_h = float(rd.get("wall_height") or 2.8)
+    unit = rd.get("unit", "m")
+
+    if w and d:
+        room_desc = f"{w:.1f} × {d:.1f} × {wall_h:.1f} {unit} (width × depth × height)"
+    else:
+        room_desc = "see reference images for proportions"
+
+    wall_refs = "\n".join(
+        f"- IMAGE {i + 2}: Front elevation of {wall_labels[i] if wall_labels and i < len(wall_labels) else f'wall {i+1}'}"
+        for i in range(n_walls)
+    )
+
+    pr = presets or {}
+    style_parts = []
+    if pr.get("room_type"):
+        style_parts.append(pr["room_type"])
+    if pr.get("decor_style"):
+        style_parts.append(pr["decor_style"])
+    style_line = ("Style: " + ", ".join(style_parts) + ".") if style_parts else ""
+
+    return f"""## Task
+Create ONE photorealistic isometric interior room view that composites all provided reference surfaces into a single coherent scene.
+Every surface must faithfully reflect its reference image — same materials, same furniture, same openings.
+{style_line}
+
+## Room dimensions
+{room_desc}
+
+## Reference images provided
+- IMAGE 1: Top-down isometric view of the floor — ground truth for furniture layout, floor material, and product positions
+{wall_refs}
+
+## Composition rules
+1. Render in a 3/4 isometric perspective (camera ~30–45° above, angled toward the front corner of the room so floor and two walls are visible)
+2. The floor must match IMAGE 1 exactly: same furniture, same positions, same floor material/texture
+3. Each wall must match its reference elevation: same openings (windows/doors at the same positions), same wall finish, same any furniture placed against it
+4. Maintain correct proportions based on room dimensions: {room_desc}
+5. Consistent lighting — soft ambient light from above, shadows matching the isometric camera angle
+6. Walls and floor meet at correct 90° angles; no distortion
+
+## Hard constraints
+- No new furniture, accessories, or architectural elements beyond what appears in the reference images
+- No text, labels, dimension lines, or watermarks on the output
+- All provided surfaces (floor + {n_walls} wall(s)) must be visible and correctly oriented
+- Photorealistic render quality — no cartoon or sketch style
+
+Output: a single photorealistic isometric room render, no overlays, no on-image text.
+""".strip()

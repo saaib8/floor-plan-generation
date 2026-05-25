@@ -88,5 +88,14 @@
     "image_url": "/products/icons/lamp.svg",
     "dims": "0.35 x 0.35",
     "dimensions": { "width": 0.35, "depth": 0.35, "height": 1.6 }
+  },
+  {
+    "id": 11,
+    "name": "Art Canvas",
+    "category": "Art Canvas",
+    "icon": "/products/icons/art_canvas.svg",
+    "image_url": "/products/icons/art_canvas.svg",
+    "dims": "0.6 x 0.8",
+    "dimensions": { "width": 0.6, "depth": 0.05, "height": 0.8 }
   }
 ]
