@@ -39,25 +39,48 @@
   <!-- Canvas area -->
   <div class="canvas-area">
 
-    <!-- Canvas 1: Floor plan drawing -->
-    <div class="canvas-panel" id="canvas1-wrap">
-      <div class="canvas-panel-header">
-        <span class="badge">1</span>
-        Floor Plan
-        <span class="info-tag" id="c1-hint">Click to draw walls · Double-click to close room</span>
-      </div>
-      <canvas id="canvas1"></canvas>
-      <div class="canvas-placeholder" id="c1-placeholder">
-        <div class="icon">🏠</div>
-        <div>Click to place first corner, then keep clicking to draw walls</div>
-        <div style="font-size:11px">Double-click or press ⬡ to close the room</div>
-      </div>
-    </div>
+    <!-- Top row: floor plan + wall elevation preview -->
+    <div class="canvas-row-top">
 
-    <!-- Canvas 2: Surface editor -->
+      <!-- Canvas 1: Floor plan drawing -->
+      <div class="canvas-panel" id="canvas1-wrap">
+        <div class="canvas-panel-header">
+          <span class="badge">1</span>
+          Floor Plan
+          <span class="info-tag" id="c1-hint">Click to draw walls · Double-click to close room</span>
+        </div>
+        <canvas id="canvas1"></canvas>
+        <div class="canvas-placeholder" id="c1-placeholder">
+          <div class="icon">🏠</div>
+          <div>Click to place first corner, then keep clicking to draw walls</div>
+          <div style="font-size:11px">Double-click or press ⬡ to close the room</div>
+        </div>
+      </div>
+
+      <!-- Resize handle between floor plan and wall elevation -->
+      <div class="panel-divider" id="top-panel-divider" style="display:none"></div>
+
+      <!-- Canvas OP: Wall elevation preview for adjusting opening heights -->
+      <div class="canvas-panel" id="canvas-op-wrap" style="display:none">
+        <div class="canvas-panel-header">
+          <span class="badge">2</span>
+          Wall Elevation
+          <span class="info-tag" id="cop-label">Drag windows ↕ to set sill height</span>
+        </div>
+        <canvas id="canvas-op"></canvas>
+        <div class="canvas-placeholder" id="cop-placeholder">
+          <div class="icon">🚪</div>
+          <div>Select a wall in Canvas 1</div>
+          <div style="font-size:11px">Drag windows ↕ to adjust sill height</div>
+        </div>
+      </div>
+
+    </div><!-- /canvas-row-top -->
+
+    <!-- Canvas 2: Surface editor (full width below) -->
     <div class="canvas-panel" id="canvas2-wrap">
       <div class="canvas-panel-header">
-        <span class="badge">2</span>
+        <span class="badge" id="c2-badge">2</span>
         Surface Editor
         <span class="info-tag" id="c2-label">Select a wall or floor in Canvas 1</span>
       </div>
@@ -87,6 +110,20 @@
       </div>
     </div>
 
+    <!-- Openings (doors & windows) -->
+    <div class="sidebar-section" id="openings-section" style="display:none">
+      <div class="sidebar-section-title">Openings</div>
+      <div id="openings-controls" style="padding:6px 10px;display:flex;gap:6px">
+        <button class="opening-add-btn" id="btn-add-door" title="Add door">🚪 Door</button>
+        <button class="opening-add-btn" id="btn-add-window" title="Add window">🪟 Window</button>
+      </div>
+      <div id="openings-list" style="padding:4px 8px">
+        <div id="no-openings-msg" style="font-size:11px;color:var(--text-muted);font-style:italic;padding:2px 4px">
+          No openings added
+        </div>
+      </div>
+    </div>
+
     <!-- Placed products -->
     <div class="sidebar-section">
       <div class="sidebar-section-title">Placed Products</div>
@@ -101,6 +138,10 @@
     <div class="sidebar-section gen-section">
       <button id="btn-generate" disabled>
         <span>⚡</span> Generate
+      </button>
+      <div id="gen-tracker-info" class="gen-tracker" style="display:none"></div>
+      <button id="btn-compose" disabled class="compose-btn" title="Compose a final isometric room view from all generated surfaces">
+        <span>🏠</span> Compose Room
       </button>
     </div>
 
@@ -174,3 +215,4 @@
 <script src="/static/app.js"></script>
 </body>
 </html>
+

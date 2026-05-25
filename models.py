@@ -5,6 +5,7 @@ from pydantic import BaseModel
 class ProductItem(BaseModel):
     product_id: Optional[int] = None
     category: Optional[str] = None
+    product_name: Optional[str] = None  # human-readable name e.g. "Work Desk", "Double Bed"
     image_url: str
     hex_color: str
     dims: Optional[str] = None
@@ -20,6 +21,7 @@ class GenerationRequest(BaseModel):
     presets: Optional[Dict[str, Any]] = None
     room_dimensions: Optional[Dict[str, Any]] = None
     type: str = "floor"           # "floor" | "wall"
+    openings: Optional[List[Dict[str, Any]]] = []
 
 
 class GenerationStartResponse(BaseModel):
@@ -33,6 +35,22 @@ class GenerationStatusResponse(BaseModel):
     result_image: Optional[str] = None  # primary (isometric) image path
     result_images: Optional[Dict[str, str]] = None  # all views: {isometric, front, corner}
     reason: Optional[str] = None
+    validation_metrics: Optional[Dict[str, Any]] = None  # spatial validation stats when enabled
+
+
+class WallImageUrl(BaseModel):
+    url: str                           # server-relative path, e.g. "/outputs/xxx_elevation.png"
+    wall_id: Optional[int] = None
+    label: Optional[str] = None
+    width_m: Optional[float] = None
+    height_m: Optional[float] = None
+
+
+class ComposeRequest(BaseModel):
+    floor_image_url: str               # server-relative path, e.g. "/outputs/xxx_isometric.png"
+    wall_image_urls: List[WallImageUrl]
+    room_dimensions: Optional[Dict[str, Any]] = None
+    presets: Optional[Dict[str, Any]] = None
 
 
 class FloorPlanRequest(BaseModel):

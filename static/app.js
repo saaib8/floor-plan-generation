@@ -4,7 +4,7 @@
 
 // ── Constants ─────────────────────────────────────────────────
 const SCALE = 60;          // pixels per metre on canvas 1
-const DEFAULT_WALL_H = 7;  // metres
+const DEFAULT_WALL_H = 2.8;  // metres
 const GRID_SIZE = SCALE;   // 1 grid square = 1m
 const SNAP_RADIUS = 12;    // px — snaps to existing points
 
@@ -29,16 +29,25 @@ const S = {
   // Surface editor
   placedProducts: [],    // [{id,product,color,cx,cy,wPx,hPx}] canvas2 coords
   colorIdx: 0,
+  surfaceLayouts: {},    // { 'floor': {placedProducts, colorIdx}, 'wall_<id>': {...} }
   draggingFromSidebar: null,  // product being dragged in
   draggingPlaced: null,       // placed product being moved {id,offX,offY}
+  draggingOpening: null,      // wall opening being moved vertically {id,startSill,startMouseY}
+
+  // Openings
+  openings: [],           // [{id, wallId, type, posAlongWall, widthM, sillHeight}]
+  addingOpening: null,    // null | 'door' | 'window'
 
   // Generation
   isGenerating: false,
+  isComposing: false,
   products: [],
+  generatedImages: {},  // { 'floor': {isometric,...}, 'wall_3': {elevation,...}, ... }
 };
 
 let wallIdSeq = 0;
 let placedIdSeq = 0;
+let openingIdSeq = 0;
 
 // ── DOM refs ───────────────────────────────────────────────────
 const c1 = document.getElementById('canvas1');
@@ -48,6 +57,13 @@ const ctx2 = c2.getContext('2d');
 
 const c1wrap = document.getElementById('canvas1-wrap');
 const c2wrap = document.getElementById('canvas2-wrap');
+const cOP = document.getElementById('canvas-op');
+const ctxOP = cOP.getContext('2d');
+const copWrap = document.getElementById('canvas-op-wrap');
+const copPlaceholder = document.getElementById('cop-placeholder');
+const copLabel = document.getElementById('cop-label');
+const c2Badge = document.getElementById('c2-badge');
+const topDivider = document.getElementById('top-panel-divider');
 const c1placeholder = document.getElementById('c1-placeholder');
 const c2placeholder = document.getElementById('c2-placeholder');
 const c2label = document.getElementById('c2-label');
@@ -64,6 +80,11 @@ const infoHeight = document.getElementById('info-height');
 const resultSection = document.getElementById('result-section');
 const resultImg = document.getElementById('result-img');
 const resultDownload = document.getElementById('result-download');
+const openingsSection = document.getElementById('openings-section');
+const openingsList = document.getElementById('openings-list');
+const noOpeningsMsg = document.getElementById('no-openings-msg');
+const btnAddDoor = document.getElementById('btn-add-door');
+const btnAddWindow = document.getElementById('btn-add-window');
 
 // ── Resize canvases ────────────────────────────────────────────
 function resizeCanvases() {
@@ -74,6 +95,12 @@ function resizeCanvases() {
   c1.height = Math.floor(r1.height) - hdr;
   c2.width  = Math.floor(r2.width);
   c2.height = Math.floor(r2.height) - hdr;
+  if (copWrap.style.display !== 'none') {
+    const rop = copWrap.getBoundingClientRect();
+    cOP.width  = Math.floor(rop.width);
+    cOP.height = Math.floor(rop.height) - hdr;
+    renderWallPreview();
+  }
   drawCanvas1();
   renderSurface();
 }
@@ -81,6 +108,7 @@ function resizeCanvases() {
 const ro = new ResizeObserver(resizeCanvases);
 ro.observe(c1wrap);
 ro.observe(c2wrap);
+ro.observe(copWrap);
 
 // ── Utilities ──────────────────────────────────────────────────
 function ptDist(a, b) {
@@ -152,6 +180,21 @@ function drawCanvas1() {
     ctx1.strokeStyle = isSelected ? '#4a7c59' : '#9a8a78';
     ctx1.lineWidth = isSelected ? 2.5 : 2;
     ctx1.stroke();
+
+    // Floor generated indicator: small dot at centroid
+    if (S.generatedImages['floor']) {
+      const cx = S.drawPoints.reduce((s, p) => s + p.x, 0) / S.drawPoints.length;
+      const cy = S.drawPoints.reduce((s, p) => s + p.y, 0) / S.drawPoints.length;
+      ctx1.save();
+      ctx1.beginPath();
+      ctx1.arc(cx, cy, 5, 0, Math.PI * 2);
+      ctx1.fillStyle = '#4a7c59';
+      ctx1.fill();
+      ctx1.strokeStyle = 'white';
+      ctx1.lineWidth = 1.5;
+      ctx1.stroke();
+      ctx1.restore();
+    }
   }
 
   // Walls (committed segments)
@@ -181,6 +224,59 @@ function drawCanvas1() {
     ctx1.textAlign = 'center';
     ctx1.textBaseline = 'middle';
     ctx1.fillText(`${w.lengthM.toFixed(2)}m`, 0, 0);
+    ctx1.restore();
+
+    // Generated indicator: small green dot on the opposite side of the normal
+    if (S.generatedImages[`wall_${w.id}`]) {
+      ctx1.save();
+      ctx1.beginPath();
+      ctx1.arc(mx - nx * 18, my - ny * 18, 4.5, 0, Math.PI * 2);
+      ctx1.fillStyle = '#4a7c59';
+      ctx1.fill();
+      ctx1.strokeStyle = 'white';
+      ctx1.lineWidth = 1.5;
+      ctx1.stroke();
+      ctx1.restore();
+    }
+  });
+
+  // Openings on walls
+  S.openings.forEach(op => {
+    const w = S.walls.find(wl => wl.id === op.wallId);
+    if (!w) return;
+    const dx = w.x2 - w.x1, dy = w.y2 - w.y1;
+    const wallLen = Math.hypot(dx, dy);
+    if (wallLen === 0) return;
+    const ux = dx / wallLen, uy = dy / wallLen; // unit along wall
+    const nx = -uy, ny = ux; // normal (perpendicular)
+    const widthPx = op.widthM * SCALE;
+    const centerPx = op.posAlongWall * wallLen;
+    const halfW = widthPx / 2;
+    const startT = Math.max(0, centerPx - halfW);
+    const endT = Math.min(wallLen, centerPx + halfW);
+    const sx = w.x1 + ux * startT, sy = w.y1 + uy * startT;
+    const ex = w.x1 + ux * endT, ey = w.y1 + uy * endT;
+    const thick = 6; // half-thickness of the gap overlay
+    const color = op.type === 'door' ? '#F0E4D2' : '#B4D7F0';
+    ctx1.save();
+    ctx1.beginPath();
+    ctx1.moveTo(sx + nx * thick, sy + ny * thick);
+    ctx1.lineTo(ex + nx * thick, ey + ny * thick);
+    ctx1.lineTo(ex - nx * thick, ey - ny * thick);
+    ctx1.lineTo(sx - nx * thick, sy - ny * thick);
+    ctx1.closePath();
+    ctx1.fillStyle = color;
+    ctx1.fill();
+    ctx1.strokeStyle = op.type === 'door' ? '#c8a878' : '#78a8c8';
+    ctx1.lineWidth = 1;
+    ctx1.stroke();
+    // Label
+    const mx = (sx + ex) / 2, my = (sy + ey) / 2;
+    ctx1.font = '9px sans-serif';
+    ctx1.textAlign = 'center';
+    ctx1.textBaseline = 'middle';
+    ctx1.fillStyle = '#5a5048';
+    ctx1.fillText(`${op.type === 'door' ? 'D' : 'W'} ${op.widthM.toFixed(1)}m`, mx + nx * 14, my + ny * 14);
     ctx1.restore();
   });
 
@@ -258,6 +354,21 @@ c1.addEventListener('mouseleave', () => {
 c1.addEventListener('click', e => {
   const { x, y } = canvasPos(c1, e);
 
+  // Opening placement mode
+  if (S.addingOpening && S.isClosed) {
+    const wall = hitTestWall(x, y, 12);
+    if (wall) {
+      const dx = wall.x2 - wall.x1, dy = wall.y2 - wall.y1;
+      const len2 = dx * dx + dy * dy;
+      const t = Math.max(0, Math.min(1, ((x - wall.x1) * dx + (y - wall.y1) * dy) / len2));
+      placeOpening(wall.id, t, S.addingOpening);
+      cancelAddOpening();
+    } else {
+      setStatus('Click on a wall segment to place the opening', '');
+    }
+    return;
+  }
+
   if (S.tool === 'select') {
     const wall = hitTestWall(x, y);
     if (wall) {
@@ -309,6 +420,7 @@ function closePolygon() {
   S.mousePos = null;
   setStatus('Room closed. Click a wall or floor to select it.', '');
   document.getElementById('c1-hint').textContent = 'Click wall to edit · Click floor area for floor view';
+  showOpeningsSection();
   drawCanvas1();
 }
 
@@ -337,23 +449,41 @@ function pointInPolygon(x, y, pts) {
 }
 
 function selectWall(wall) {
+  saveSurfaceLayout();
   S.selectedSurface = {
     type: 'wall',
     wallId: wall.id,
     widthM: wall.lengthM,
     heightM: DEFAULT_WALL_H,
+    mirrorX: wallNeedsFlip(wall),
     wall,
   };
-  S.placedProducts = [];
-  S.colorIdx = 0;
+  restoreSurfaceLayout(`wall_${wall.id}`);
+  // Show wall elevation preview panel + resize divider
+  copWrap.style.display = '';
+  topDivider.style.display = '';
+  c2Badge.textContent = '3';
+  const rop = copWrap.getBoundingClientRect();
+  const hdr = 28;
+  cOP.width  = Math.max(100, Math.floor(rop.width));
+  cOP.height = Math.max(80, Math.floor(rop.height) - hdr);
   updateSurfaceInfo();
   drawCanvas1();
+  renderWallPreview();
   renderSurface();
   updatePlacedList();
   updateGenerateBtn();
+  // Restore previously generated image for this wall (or hide result section)
+  const wallKey = `wall_${wall.id}`;
+  if (S.generatedImages[wallKey]) {
+    showResult(S.generatedImages[wallKey]);
+  } else {
+    resultSection.style.display = 'none';
+  }
 }
 
 function selectFloor() {
+  saveSurfaceLayout();
   // Compute bounding box of the floor polygon
   const xs = S.drawPoints.map(p => p.x);
   const ys = S.drawPoints.map(p => p.y);
@@ -365,13 +495,26 @@ function selectFloor() {
     heightM: hM,
     polygon: S.drawPoints,
   };
-  S.placedProducts = [];
-  S.colorIdx = 0;
+  restoreSurfaceLayout('floor');
+  // Hide wall elevation preview panel + divider, reset flex
+  copWrap.style.display = 'none';
+  topDivider.style.display = 'none';
+  c1wrap.style.flexBasis = '';
+  c1wrap.style.flexGrow = '';
+  copWrap.style.flexBasis = '';
+  copWrap.style.flexGrow = '';
+  c2Badge.textContent = '2';
   updateSurfaceInfo();
   drawCanvas1();
   renderSurface();
   updatePlacedList();
   updateGenerateBtn();
+  // Restore previously generated floor image (or hide result section)
+  if (S.generatedImages['floor']) {
+    showResult(S.generatedImages['floor']);
+  } else {
+    resultSection.style.display = 'none';
+  }
 }
 
 // ── Surface info ───────────────────────────────────────────────
@@ -391,7 +534,8 @@ function updateSurfaceInfo() {
   if (S.selectedSurface.type === 'wall') {
     const w = S.selectedSurface.wall;
     const wIdx = S.walls.findIndex(x => x.id === w.id) + 1;
-    c2label.textContent = `Wall ${wIdx} · ${w.lengthM.toFixed(2)}m × ${DEFAULT_WALL_H}m`;
+    copLabel.textContent = `Wall ${wIdx} · ${w.lengthM.toFixed(2)}m × ${DEFAULT_WALL_H}m · Drag windows ↕`;
+    c2label.textContent = `Drag products onto the wall surface`;
   } else {
     c2label.textContent = `Floor · ${S.selectedSurface.widthM.toFixed(2)}m × ${S.selectedSurface.heightM.toFixed(2)}m`;
   }
@@ -451,12 +595,120 @@ function renderSurface() {
   ctx2.lineWidth = 1.5;
   ctx2.strokeRect(ox, oy, surfW, surfH);
 
+  // Openings on floor surface edges
+  if (S.selectedSurface.type === 'floor' && S.openings.length > 0) {
+    const xs = S.drawPoints.map(p => p.x);
+    const ys = S.drawPoints.map(p => p.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const roomWPx = maxX - minX, roomHPx = maxY - minY;
+    const thick = 5; // visual thickness of the opening marker (px)
+
+    S.openings.forEach(op => {
+      const wall = S.walls.find(w => w.id === op.wallId);
+      if (!wall) return;
+      const compass = wallToCompass(wall);
+      // Compute opening center position along wall in canvas1 coords
+      const dx = wall.x2 - wall.x1, dy = wall.y2 - wall.y1;
+      const wallLen = Math.hypot(dx, dy);
+      const centerAlongWall = op.posAlongWall * wallLen;
+      const ptX = wall.x1 + (dx / wallLen) * centerAlongWall;
+      const ptY = wall.y1 + (dy / wallLen) * centerAlongWall;
+      const halfWPx = (op.widthM * SCALE) / 2;
+
+      const color = op.type === 'door' ? '#E8D4B0' : '#A8CCE8';
+      const borderColor = op.type === 'door' ? '#C0A070' : '#6898C0';
+      const label = op.type === 'door' ? 'D' : 'W';
+
+      let rx, ry, rw, rh;
+      if (compass === 'north') {
+        const fracL = ((ptX - halfWPx) - minX) / roomWPx;
+        const fracR = ((ptX + halfWPx) - minX) / roomWPx;
+        rx = ox + fracL * surfW;
+        rw = (fracR - fracL) * surfW;
+        ry = oy - thick;
+        rh = thick * 2;
+      } else if (compass === 'south') {
+        const fracL = ((ptX - halfWPx) - minX) / roomWPx;
+        const fracR = ((ptX + halfWPx) - minX) / roomWPx;
+        rx = ox + fracL * surfW;
+        rw = (fracR - fracL) * surfW;
+        ry = oy + surfH - thick;
+        rh = thick * 2;
+      } else if (compass === 'west') {
+        const fracT = ((ptY - halfWPx) - minY) / roomHPx;
+        const fracB = ((ptY + halfWPx) - minY) / roomHPx;
+        rx = ox - thick;
+        rw = thick * 2;
+        ry = oy + fracT * surfH;
+        rh = (fracB - fracT) * surfH;
+      } else { // east
+        const fracT = ((ptY - halfWPx) - minY) / roomHPx;
+        const fracB = ((ptY + halfWPx) - minY) / roomHPx;
+        rx = ox + surfW - thick;
+        rw = thick * 2;
+        ry = oy + fracT * surfH;
+        rh = (fracB - fracT) * surfH;
+      }
+      ctx2.fillStyle = color;
+      ctx2.fillRect(rx, ry, rw, rh);
+      ctx2.strokeStyle = borderColor;
+      ctx2.lineWidth = 1;
+      ctx2.strokeRect(rx, ry, rw, rh);
+      // Label
+      ctx2.fillStyle = '#5a5048';
+      ctx2.font = 'bold 9px sans-serif';
+      ctx2.textAlign = 'center';
+      ctx2.textBaseline = 'middle';
+      ctx2.fillText(label, rx + rw / 2, ry + rh / 2);
+    });
+  }
+
   // Floor/ceiling lines for wall view
   if (S.selectedSurface.type === 'wall') {
     ctx2.fillStyle = '#c8c0b0';
     ctx2.fillRect(ox, oy + surfH, surfW, 6);
     ctx2.fillStyle = '#e0d8d0';
     ctx2.fillRect(ox, oy - 4, surfW, 4);
+
+    // Openings on the selected wall
+    const wallId = S.selectedSurface.wallId;
+    const wallOpenings = S.openings.filter(op => op.wallId === wallId);
+    const wallH = S.selectedSurface.heightM;
+
+    wallOpenings.forEach(op => {
+      const halfFracW = (op.widthM / S.selectedSurface.widthM) / 2;
+      const displayFrac = opDisplayFrac(op);
+      const x0 = ox + (displayFrac - halfFracW) * surfW;
+      const x1 = ox + (displayFrac + halfFracW) * surfW;
+      const opH = op.heightM ?? (op.type === 'door' ? DOOR_H_M : WINDOW_H_M);
+
+      let y0, y1;
+      const floorY = oy + surfH;
+      if (op.type === 'door') {
+        y1 = floorY;
+        y0 = floorY - (opH / wallH) * surfH;
+      } else {
+        const sill = op.sillHeight ?? 1.2;
+        y1 = floorY - (sill / wallH) * surfH;
+        y0 = floorY - ((sill + opH) / wallH) * surfH;
+      }
+
+      const color = op.type === 'door' ? '#E8D4B0' : '#A8CCE8';
+      const borderColor = op.type === 'door' ? '#C0A070' : '#6898C0';
+      const label = op.type === 'door' ? 'D' : 'W';
+
+      ctx2.fillStyle = color;
+      ctx2.fillRect(x0, y0, x1 - x0, y1 - y0);
+      ctx2.strokeStyle = borderColor;
+      ctx2.lineWidth = 1.5;
+      ctx2.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      ctx2.fillStyle = '#5a5048';
+      ctx2.font = 'bold 9px sans-serif';
+      ctx2.textAlign = 'center';
+      ctx2.textBaseline = 'middle';
+      ctx2.fillText(label, (x0 + x1) / 2, (y0 + y1) / 2);
+    });
   }
 
   // Placed products
@@ -513,6 +765,209 @@ function renderSurface() {
   ctx2.restore();
 }
 
+// ── Canvas OP: wall elevation opening-height preview ──────────
+const DOOR_H_M = 2.2;
+const WINDOW_H_M = 0.9;
+
+function renderWallPreview() {
+  const W = cOP.width, H = cOP.height;
+  ctxOP.clearRect(0, 0, W, H);
+  copPlaceholder.style.display = 'none';
+
+  if (!S.selectedSurface || S.selectedSurface.type !== 'wall') {
+    copPlaceholder.style.display = 'flex';
+    return;
+  }
+
+  const { widthM, heightM } = S.selectedSurface;
+  const PAD = 28;
+  const sc = Math.min((W - PAD * 2) / widthM, (H - PAD * 2) / heightM);
+  const surfW = widthM * sc;
+  const surfH = heightM * sc;
+  const ox = (W - surfW) / 2;
+  const oy = (H - surfH) / 2;
+
+  cOP._transform = { ox, oy, sc, surfW, surfH, widthM, heightM };
+
+  // Wall background + plaster lines
+  ctxOP.fillStyle = '#f5f2ee';
+  ctxOP.fillRect(ox, oy, surfW, surfH);
+  ctxOP.strokeStyle = '#e8e0d8';
+  ctxOP.lineWidth = 0.5;
+  for (let y = oy + 30; y < oy + surfH; y += 30) {
+    ctxOP.beginPath(); ctxOP.moveTo(ox, y); ctxOP.lineTo(ox + surfW, y); ctxOP.stroke();
+  }
+
+  // Border
+  ctxOP.strokeStyle = '#7a7068';
+  ctxOP.lineWidth = 1.5;
+  ctxOP.strokeRect(ox, oy, surfW, surfH);
+
+  // Floor/ceiling strips
+  ctxOP.fillStyle = '#c8c0b0';
+  ctxOP.fillRect(ox, oy + surfH, surfW, 6);
+  ctxOP.fillStyle = '#e0d8d0';
+  ctxOP.fillRect(ox, oy - 4, surfW, 4);
+
+  // Draw openings on this wall
+  const wallId = S.selectedSurface.wallId;
+  const wallOpenings = S.openings.filter(op => op.wallId === wallId);
+  const floorY = oy + surfH;
+
+  wallOpenings.forEach(op => {
+    const halfFracW = (op.widthM / widthM) / 2;
+    const displayFrac = opDisplayFrac(op);
+    const x0 = ox + (displayFrac - halfFracW) * surfW;
+    const x1 = ox + (displayFrac + halfFracW) * surfW;
+    const opH = op.heightM ?? (op.type === 'door' ? DOOR_H_M : WINDOW_H_M);
+
+    let y0, y1;
+    if (op.type === 'door') {
+      y1 = floorY;
+      y0 = floorY - (opH / heightM) * surfH;
+    } else {
+      const sill = op.sillHeight ?? 1.2;
+      y1 = floorY - (sill / heightM) * surfH;
+      y0 = floorY - ((sill + opH) / heightM) * surfH;
+    }
+
+    const isActive = S.draggingOpening && S.draggingOpening.id === op.id;
+    const color = op.type === 'door' ? '#E8D4B0' : '#A8CCE8';
+    const borderColor = isActive ? '#2a7ae8' : (op.type === 'door' ? '#C0A070' : '#6898C0');
+
+    ctxOP.fillStyle = color;
+    ctxOP.fillRect(x0, y0, x1 - x0, y1 - y0);
+    ctxOP.strokeStyle = borderColor;
+    ctxOP.lineWidth = isActive ? 2 : 1.5;
+    ctxOP.strokeRect(x0, y0, x1 - x0, y1 - y0);
+
+    ctxOP.fillStyle = '#5a5048';
+    ctxOP.font = 'bold 9px sans-serif';
+    ctxOP.textAlign = 'center';
+    ctxOP.textBaseline = 'middle';
+    ctxOP.fillText(op.type === 'door' ? 'D' : 'W', (x0 + x1) / 2, (y0 + y1) / 2);
+
+    // Drag handles + sill label for windows
+    if (op.type === 'window') {
+      const midX = (x0 + x1) / 2;
+      ctxOP.fillStyle = '#6898C0';
+      ctxOP.font = '13px sans-serif';
+      ctxOP.textAlign = 'center';
+      ctxOP.textBaseline = 'middle';
+      ctxOP.fillText('⇕', midX, y0 - 10);
+      ctxOP.font = '10px sans-serif';
+      ctxOP.fillText(`${(op.sillHeight ?? 1.2).toFixed(2)}m`, midX, y1 + 12);
+    }
+  });
+
+  // Dimension labels
+  ctxOP.fillStyle = '#9a9088';
+  ctxOP.font = '10px sans-serif';
+  ctxOP.textAlign = 'center';
+  ctxOP.fillText(`${widthM.toFixed(2)} m`, ox + surfW / 2, oy + surfH + 22);
+  ctxOP.save();
+  ctxOP.translate(ox - 14, oy + surfH / 2);
+  ctxOP.rotate(-Math.PI / 2);
+  ctxOP.fillText(`${heightM.toFixed(2)} m`, 0, 0);
+  ctxOP.restore();
+}
+
+function hitTestWallOpening(x, y) {
+  if (!S.selectedSurface || S.selectedSurface.type !== 'wall') return null;
+  const t = cOP._transform;
+  if (!t) return null;
+  const { ox, oy, surfW, surfH, widthM, heightM } = t;
+  const floorY = oy + surfH;
+  const wallId = S.selectedSurface.wallId;
+
+  for (const op of S.openings.filter(o => o.wallId === wallId)) {
+    const halfFracW = (op.widthM / widthM) / 2;
+    const displayFrac = opDisplayFrac(op);
+    const x0 = ox + (displayFrac - halfFracW) * surfW;
+    const x1 = ox + (displayFrac + halfFracW) * surfW;
+    const opH = op.heightM ?? (op.type === 'door' ? DOOR_H_M : WINDOW_H_M);
+    let y0, y1;
+    if (op.type === 'door') {
+      y1 = floorY;
+      y0 = floorY - (opH / heightM) * surfH;
+    } else {
+      const sill = op.sillHeight ?? 1.2;
+      y1 = floorY - (sill / heightM) * surfH;
+      y0 = floorY - ((sill + opH) / heightM) * surfH;
+    }
+    if (x >= x0 - 4 && x <= x1 + 4 && y >= y0 - 4 && y <= y1 + 4) return op;
+  }
+  return null;
+}
+
+function openingCursor(op) {
+  return op.type === 'window' ? 'move' : 'ew-resize';
+}
+
+cOP.addEventListener('mousedown', e => {
+  const { x, y } = canvasPos(cOP, e);
+  const op = hitTestWallOpening(x, y);
+  if (op) {
+    S.draggingOpening = {
+      id: op.id,
+      startSill: op.sillHeight ?? 1.2,
+      startPosAlongWall: op.posAlongWall,
+      startMouseX: x,
+      startMouseY: y,
+    };
+    cOP.style.cursor = openingCursor(op);
+  }
+});
+
+cOP.addEventListener('mousemove', e => {
+  const { x, y } = canvasPos(cOP, e);
+  if (S.draggingOpening) {
+    const t = cOP._transform;
+    if (!t) return;
+    const op = S.openings.find(o => o.id === S.draggingOpening.id);
+    if (!op) return;
+    const { widthM, heightM } = S.selectedSurface;
+
+    // Horizontal drag (all openings); invert direction for mirrored walls
+    const rawDeltaFrac = (x - S.draggingOpening.startMouseX) / t.surfW;
+    const deltaFrac = S.selectedSurface.mirrorX ? -rawDeltaFrac : rawDeltaFrac;
+    const halfFracW = (op.widthM / widthM) / 2;
+    op.posAlongWall = Math.max(halfFracW, Math.min(1 - halfFracW,
+      S.draggingOpening.startPosAlongWall + deltaFrac));
+
+    // Vertical drag (windows only)
+    if (op.type === 'window') {
+      const opH = op.heightM ?? WINDOW_H_M;
+      const deltaSill = -(y - S.draggingOpening.startMouseY) / t.sc;
+      const maxSill = heightM - opH;
+      op.sillHeight = Math.max(0, Math.min(maxSill, S.draggingOpening.startSill + deltaSill));
+    }
+
+    renderWallPreview();
+    renderSurface();
+    drawCanvas1(); // keep floor plan opening markers in sync
+  } else {
+    const hovered = hitTestWallOpening(x, y);
+    cOP.style.cursor = hovered ? openingCursor(hovered) : 'default';
+  }
+});
+
+cOP.addEventListener('mouseup', () => {
+  if (S.draggingOpening) {
+    S.draggingOpening = null;
+    cOP.style.cursor = 'default';
+    updateOpeningsList();
+  }
+});
+
+cOP.addEventListener('mouseleave', () => {
+  if (S.draggingOpening) {
+    S.draggingOpening = null;
+    cOP.style.cursor = 'default';
+    updateOpeningsList();
+  }
+});
+
 // ── Canvas 2: drag/drop from sidebar ──────────────────────────
 c2.addEventListener('dragover', e => {
   e.preventDefault();
@@ -535,9 +990,14 @@ function placeProduct(product, dropX, dropY) {
   if (!t) return;
 
   // Product pixel dimensions on canvas2
+  // Wall elevation: vertical axis = product standing height (height > depth > width)
+  // Floor plan:     vertical axis = room-depth footprint   (depth  > height > width)
   const dims = product.dimensions || {};
   const wM = dims.width || 1;
-  const dM = dims.depth || dims.height || wM;
+  const isWallSurface = S.selectedSurface && S.selectedSurface.type === 'wall';
+  const dM = isWallSurface
+    ? (dims.height || dims.depth || wM)
+    : (dims.depth  || dims.height || wM);
   const wPx = Math.max(30, wM * t.sc);
   const hPx = Math.max(30, dM * t.sc);
 
@@ -663,6 +1123,31 @@ function updatePlacedList() {
   });
 }
 
+function currentSurfaceKey() {
+  if (!S.selectedSurface) return null;
+  return S.selectedSurface.type === 'floor' ? 'floor' : `wall_${S.selectedSurface.wallId}`;
+}
+
+function saveSurfaceLayout() {
+  const key = currentSurfaceKey();
+  if (!key) return;
+  S.surfaceLayouts[key] = {
+    placedProducts: S.placedProducts.map(pp => ({ ...pp })),
+    colorIdx: S.colorIdx,
+  };
+}
+
+function restoreSurfaceLayout(key) {
+  const saved = S.surfaceLayouts[key];
+  if (saved) {
+    S.placedProducts = saved.placedProducts.map(pp => ({ ...pp }));
+    S.colorIdx = saved.colorIdx;
+  } else {
+    S.placedProducts = [];
+    S.colorIdx = 0;
+  }
+}
+
 function updateGenerateBtn() {
   const hasProducts = S.placedProducts.length > 0;
   const allHaveUrls = S.placedProducts.every(pp => pp.imageUrl.trim());
@@ -670,6 +1155,34 @@ function updateGenerateBtn() {
   btnGenerate.title = hasProducts && !allHaveUrls
     ? 'Add a product photo URL for each placed product'
     : '';
+}
+
+function updateComposeBtn() {
+  const hasFloor = !!S.generatedImages['floor'];
+  const hasWall = Object.keys(S.generatedImages).some(k => k.startsWith('wall_'));
+  const btnCompose = document.getElementById('btn-compose');
+  if (btnCompose) {
+    btnCompose.disabled = !(hasFloor && hasWall) || S.isComposing;
+  }
+  _updateGenTracker();
+}
+
+function _updateGenTracker() {
+  const tracker = document.getElementById('gen-tracker-info');
+  if (!tracker) return;
+  const keys = Object.keys(S.generatedImages);
+  if (keys.length === 0) {
+    tracker.style.display = 'none';
+    return;
+  }
+  tracker.style.display = '';
+  const wallCount = keys.filter(k => k.startsWith('wall_')).length;
+  const totalWalls = S.walls.length;
+  const floorDone = !!S.generatedImages['floor'];
+  const parts = [];
+  if (floorDone) parts.push('Floor ✓');
+  if (wallCount > 0) parts.push(`Walls ${wallCount}/${totalWalls}`);
+  tracker.textContent = parts.join(' · ');
 }
 
 // ── Toolbar buttons ────────────────────────────────────────────
@@ -696,13 +1209,31 @@ document.getElementById('tool-clear').addEventListener('click', () => {
   S.isClosed = false;
   S.selectedSurface = null;
   S.placedProducts = [];
+  S.openings = [];
+  S.addingOpening = null;
+  S.draggingOpening = null;
   S.colorIdx = 0;
+  S.generatedImages = {};
+  S.surfaceLayouts = {};
+  S.isComposing = false;
   wallIdSeq = 0;
   placedIdSeq = 0;
+  openingIdSeq = 0;
+  copWrap.style.display = 'none';
+  topDivider.style.display = 'none';
+  c1wrap.style.flexBasis = '';
+  c1wrap.style.flexGrow = '';
+  copWrap.style.flexBasis = '';
+  copWrap.style.flexGrow = '';
+  c2Badge.textContent = '2';
   document.getElementById('c1-hint').textContent = 'Click to draw walls · Double-click to close room';
   updateSurfaceInfo();
   updatePlacedList();
+  updateOpeningsList();
+  showOpeningsSection();
   updateGenerateBtn();
+  updateComposeBtn();
+  resultSection.style.display = 'none';
   renderSurface();
   drawCanvas1();
   setStatus('Ready', '');
@@ -710,6 +1241,253 @@ document.getElementById('tool-clear').addEventListener('click', () => {
 
 document.getElementById('tool-close').addEventListener('click', () => {
   if (!S.isClosed && S.drawPoints.length >= 3) closePolygon();
+});
+
+// ── Openings (doors & windows) ─────────────────────────────
+function showOpeningsSection() {
+  openingsSection.style.display = S.isClosed ? '' : 'none';
+}
+
+function startAddOpening(type) {
+  if (S.addingOpening === type) { cancelAddOpening(); return; }
+  S.addingOpening = type;
+  btnAddDoor.classList.toggle('active', type === 'door');
+  btnAddWindow.classList.toggle('active', type === 'window');
+  c1.style.cursor = 'pointer';
+  setStatus(`Click on a wall to place a ${type}`, '');
+}
+
+function cancelAddOpening() {
+  S.addingOpening = null;
+  btnAddDoor.classList.remove('active');
+  btnAddWindow.classList.remove('active');
+  c1.style.cursor = S.tool === 'draw' ? 'crosshair' : 'default';
+  setStatus(S.isClosed ? 'Room closed. Click a wall or floor to select it.' : 'Ready', '');
+}
+
+function placeOpening(wallId, posAlongWall, type) {
+  const wall = S.walls.find(w => w.id === wallId);
+  if (!wall) return;
+  const defaultW = type === 'door' ? 0.9 : 1.5;
+  // Clamp width so it doesn't exceed wall length
+  const widthM = Math.min(defaultW, wall.lengthM * 0.95);
+  // Clamp position so opening stays within wall
+  const halfFrac = (widthM / wall.lengthM) / 2;
+  const clampedPos = Math.max(halfFrac, Math.min(1 - halfFrac, posAlongWall));
+  S.openings.push({
+    id: ++openingIdSeq,
+    wallId,
+    type,
+    posAlongWall: clampedPos,
+    widthM,
+    heightM: type === 'door' ? DOOR_H_M : WINDOW_H_M,
+    sillHeight: type === 'window' ? 1.2 : 0,
+  });
+  updateOpeningsList();
+  renderWallPreview();
+  drawCanvas1();
+}
+
+function updateOpeningsList() {
+  if (S.openings.length === 0) {
+    openingsList.innerHTML = '';
+    openingsList.appendChild(noOpeningsMsg);
+    noOpeningsMsg.style.display = '';
+    return;
+  }
+  noOpeningsMsg.style.display = 'none';
+  const items = S.openings.map(op => {
+    const wallIdx = S.walls.findIndex(w => w.id === op.wallId) + 1;
+    const div = document.createElement('div');
+    div.className = 'opening-item';
+    const opH = op.heightM ?? (op.type === 'door' ? DOOR_H_M : WINDOW_H_M);
+    const maxH = DEFAULT_WALL_H.toFixed(1);   // height can always go up to wall height; sill auto-adjusts
+    const sillMax = (DEFAULT_WALL_H - opH).toFixed(1);
+    const sillInput = op.type === 'window'
+      ? `<input class="sill-input" type="number" step="0.1" min="0" max="${sillMax}" value="${(op.sillHeight ?? 1.2).toFixed(1)}" data-id="${op.id}" title="Sill height from floor (m)" /><span style="font-size:9px;color:var(--text-muted)">↕</span>`
+      : '';
+    div.innerHTML = `
+      <span class="opening-icon">${op.type === 'door' ? '🚪' : '🪟'}</span>
+      <span class="opening-label">Wall ${wallIdx}</span>
+      <input class="width-input" type="number" step="0.1" min="0.3" max="10" value="${op.widthM.toFixed(1)}" data-id="${op.id}" title="Width (m)" />
+      <span style="font-size:9px;color:var(--text-muted)">w</span>
+      <input class="height-input" type="number" step="0.1" min="0.3" max="${maxH}" value="${opH.toFixed(1)}" data-id="${op.id}" title="Height (m)" />
+      <span style="font-size:9px;color:var(--text-muted)">h</span>
+      ${sillInput}
+      <button class="remove-btn" data-id="${op.id}" title="Remove">×</button>
+    `;
+    return div;
+  });
+  openingsList.innerHTML = '';
+  items.forEach(el => {
+    el.querySelector('.remove-btn').addEventListener('click', evt => {
+      const id = parseInt(evt.target.dataset.id);
+      S.openings = S.openings.filter(o => o.id !== id);
+      updateOpeningsList();
+      renderWallPreview();
+      renderSurface();
+      drawCanvas1();
+    });
+    el.querySelector('.width-input').addEventListener('input', evt => {
+      const id = parseInt(evt.target.dataset.id);
+      const op = S.openings.find(o => o.id === id);
+      if (!op) return;
+      const wall = S.walls.find(w => w.id === op.wallId);
+      let val = parseFloat(evt.target.value) || 0.3;
+      if (wall) val = Math.min(val, wall.lengthM * 0.95);
+      op.widthM = Math.max(0.3, val);
+      if (wall) {
+        const halfFrac = (op.widthM / wall.lengthM) / 2;
+        op.posAlongWall = Math.max(halfFrac, Math.min(1 - halfFrac, op.posAlongWall));
+      }
+      renderWallPreview();
+      renderSurface();
+      drawCanvas1();
+    });
+    const sillEl = el.querySelector('.sill-input');
+    if (sillEl) {
+      sillEl.addEventListener('input', evt => {
+        const id = parseInt(evt.target.dataset.id);
+        const op = S.openings.find(o => o.id === id);
+        if (!op) return;
+        const opH2 = op.heightM ?? WINDOW_H_M;
+        const maxSill = DEFAULT_WALL_H - opH2;
+        op.sillHeight = Math.max(0, Math.min(maxSill, parseFloat(evt.target.value) || 0));
+        renderWallPreview();
+        renderSurface();
+      });
+    }
+    const heightEl = el.querySelector('.height-input');
+    if (heightEl) {
+      heightEl.addEventListener('input', evt => {
+        const id = parseInt(evt.target.dataset.id);
+        const op = S.openings.find(o => o.id === id);
+        if (!op) return;
+        const requested = Math.max(0.3, Math.min(DEFAULT_WALL_H, parseFloat(evt.target.value) || 0.3));
+        op.heightM = requested;
+        if (op.type === 'window') {
+          // Auto-lower sill to make room if the window height exceeds available space
+          const maxSill = DEFAULT_WALL_H - op.heightM;
+          if ((op.sillHeight ?? 1.2) > maxSill) {
+            op.sillHeight = Math.max(0, maxSill);
+            // Update sill input to reflect the auto-adjustment
+            const sillEl2 = evt.target.closest('.opening-item').querySelector('.sill-input');
+            if (sillEl2) sillEl2.value = op.sillHeight.toFixed(1);
+          }
+        }
+        renderWallPreview();
+        renderSurface();
+      });
+    }
+    openingsList.appendChild(el);
+  });
+}
+
+// Returns true when posAlongWall=0 is on the viewer's RIGHT in the interior elevation
+// (cross product of wall-direction × inward-normal < 0 → flip needed)
+function wallNeedsFlip(wall) {
+  const cx = S.drawPoints.reduce((s, p) => s + p.x, 0) / S.drawPoints.length;
+  const cy = S.drawPoints.reduce((s, p) => s + p.y, 0) / S.drawPoints.length;
+  const mx = (wall.x1 + wall.x2) / 2;
+  const my = (wall.y1 + wall.y2) / 2;
+  const dx = wall.x2 - wall.x1;
+  const dy = wall.y2 - wall.y1;
+  const inX = cx - mx, inY = cy - my;
+  return (dx * inY - dy * inX) < 0;
+}
+
+// Returns the display fraction for canvas2/cOP (accounts for interior-view mirroring)
+function opDisplayFrac(op) {
+  return (S.selectedSurface && S.selectedSurface.mirrorX) ? 1 - op.posAlongWall : op.posAlongWall;
+}
+
+function wallToCompass(wall) {
+  const dx = wall.x2 - wall.x1;
+  const dy = wall.y2 - wall.y1;
+  const isHorizontal = Math.abs(dx) >= Math.abs(dy);
+  const xs = S.drawPoints.map(p => p.x);
+  const ys = S.drawPoints.map(p => p.y);
+  const centerY = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const centerX = (Math.min(...xs) + Math.max(...xs)) / 2;
+  const midY = (wall.y1 + wall.y2) / 2;
+  const midX = (wall.x1 + wall.x2) / 2;
+  if (isHorizontal) {
+    return midY < centerY ? 'north' : 'south';
+  } else {
+    return midX < centerX ? 'west' : 'east';
+  }
+}
+
+function mapOpeningsToCompass() {
+  const xs = S.drawPoints.map(p => p.x);
+  const ys = S.drawPoints.map(p => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const roomWM = (maxX - minX) / SCALE;
+  const roomHM = (maxY - minY) / SCALE;
+
+  return S.openings.map((op, i) => {
+    const wall = S.walls.find(w => w.id === op.wallId);
+    if (!wall) return null;
+    const compass = wallToCompass(wall);
+    const dx = wall.x2 - wall.x1, dy = wall.y2 - wall.y1;
+    const wallLen = Math.hypot(dx, dy);
+    const centerAlongWall = op.posAlongWall * wallLen; // px along wall
+    // Point on wall at the opening center
+    const ptX = wall.x1 + (dx / wallLen) * centerAlongWall;
+    const ptY = wall.y1 + (dy / wallLen) * centerAlongWall;
+    // Project onto compass axis to get position_from_left
+    let posFromLeft = 0;
+    if (compass === 'north' || compass === 'south') {
+      posFromLeft = (ptX - minX) / SCALE - op.widthM / 2;
+    } else {
+      posFromLeft = (ptY - minY) / SCALE - op.widthM / 2;
+    }
+    posFromLeft = Math.max(0, posFromLeft);
+
+    return {
+      id: `${op.type}_${String(i + 1).padStart(2, '0')}`,
+      type: op.type,
+      wall: compass,
+      position_from_left: parseFloat(posFromLeft.toFixed(3)),
+      width: op.widthM,
+      height: op.heightM ?? (op.type === 'door' ? DOOR_H_M : WINDOW_H_M),
+      sill_height: op.type === 'window' ? (op.sillHeight ?? 1.2) : undefined,
+    };
+  }).filter(Boolean);
+}
+
+function mapWallOpenings(wallId) {
+  const wall = S.walls.find(w => w.id === wallId);
+  if (!wall) return [];
+  // For wall elevation: mirror posAlongWall if the selected wall needs a flip
+  const flip = S.selectedSurface && S.selectedSurface.wallId === wallId && S.selectedSurface.mirrorX;
+  return S.openings
+    .filter(op => op.wallId === wallId)
+    .map((op, i) => {
+      const effectivePos = flip ? (1 - op.posAlongWall) : op.posAlongWall;
+      const posFromLeft = Math.max(0, parseFloat(
+        (effectivePos * wall.lengthM - op.widthM / 2).toFixed(3)
+      ));
+      return {
+        id: `${op.type}_${String(i + 1).padStart(2, '0')}`,
+        type: op.type,
+        position_from_left: posFromLeft,
+        width: op.widthM,
+        height: op.heightM ?? (op.type === 'door' ? DOOR_H_M : WINDOW_H_M),
+        sill_height: op.type === 'window' ? (op.sillHeight ?? 1.2) : undefined,
+      };
+    });
+}
+
+btnAddDoor.addEventListener('click', () => startAddOpening('door'));
+btnAddWindow.addEventListener('click', () => startAddOpening('window'));
+
+// Escape key cancels opening placement
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && S.addingOpening) {
+    cancelAddOpening();
+  }
 });
 
 // ── Catalog / sidebar ──────────────────────────────────────────
@@ -746,6 +1524,39 @@ function renderCatalog() {
     catalogList.appendChild(div);
   });
 }
+
+// ── Top panel resize divider ───────────────────────────────────
+let _dividerActive = false;
+
+topDivider.addEventListener('mousedown', e => {
+  _dividerActive = true;
+  topDivider.classList.add('dragging');
+  document.body.style.cursor = 'col-resize';
+  document.body.style.userSelect = 'none';
+  e.preventDefault();
+});
+
+document.addEventListener('mousemove', e => {
+  if (!_dividerActive) return;
+  const rowEl = c1wrap.parentElement; // .canvas-row-top
+  const rowRect = rowEl.getBoundingClientRect();
+  if (rowRect.width === 0) return;
+  const pct = Math.max(15, Math.min(85, (e.clientX - rowRect.left) / rowRect.width * 100));
+  c1wrap.style.flexBasis = pct + '%';
+  c1wrap.style.flexGrow = '0';
+  copWrap.style.flexBasis = (100 - pct) + '%';
+  copWrap.style.flexGrow = '0';
+  resizeCanvases();
+});
+
+document.addEventListener('mouseup', () => {
+  if (_dividerActive) {
+    _dividerActive = false;
+    topDivider.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  }
+});
 
 // ── Export highlight image ─────────────────────────────────────
 function exportHighlightImage() {
@@ -787,12 +1598,13 @@ btnGenerate.addEventListener('click', async () => {
 
   const t = c2._transform;
   const products = S.placedProducts.map(pp => {
-    // Center position in metres within the surface
-    const x_m = t ? parseFloat(((pp.cx - t.ox + pp.wPx / 2) / t.sc).toFixed(3)) : null;
+    // Center position in metres within the surface (interior-view coordinates)
+    let x_m = t ? parseFloat(((pp.cx - t.ox + pp.wPx / 2) / t.sc).toFixed(3)) : null;
     const y_m = t ? parseFloat(((pp.cy - t.oy + pp.hPx / 2) / t.sc).toFixed(3)) : null;
     return {
       product_id: pp.product.id,
       category: pp.product.category || '',
+      product_name: pp.product.name || pp.product.category || '',
       image_url: pp.imageUrl.trim(),
       hex_color: pp.color,
       dims: pp.product.dims || '',
@@ -809,12 +1621,17 @@ btnGenerate.addEventListener('click', async () => {
     unit: 'm',
   };
 
+  const openings = S.selectedSurface.type === 'floor'
+    ? mapOpeningsToCompass()
+    : mapWallOpenings(S.selectedSurface.wallId);
+
   const body = {
     highlight_image: highlightImg,
     products,
     presets: {},
     room_dimensions: roomDimensions,
     type: S.selectedSurface.type,
+    openings,
   };
 
   S.isGenerating = true;
@@ -846,7 +1663,7 @@ btnGenerate.addEventListener('click', async () => {
 
 async function pollGeneration(genId) {
   const INTERVAL = 2000;
-  const MAX_WAIT = 5 * 60 * 1000; // 5 min
+  const MAX_WAIT = 10 * 60 * 1000; // 10 min
   const start = Date.now();
 
   const poll = async () => {
@@ -865,7 +1682,15 @@ async function pollGeneration(genId) {
         setStatus('Generation complete!', 'success');
         S.isGenerating = false;
         updateGenerateBtn();
-        showResult(data.result_images || { isometric: data.result_image });
+        const images = data.result_images || { isometric: data.result_image };
+        // Store result keyed by current surface so it persists across surface switches
+        const key = currentSurfaceKey();
+        if (key) {
+          S.generatedImages[key] = images;
+          drawCanvas1();
+          updateComposeBtn();
+        }
+        showResult(images);
       } else if (data.status === 'failed') {
         setStatus(`Generation failed: ${data.reason || 'unknown error'}`, 'error');
         S.isGenerating = false;
@@ -881,8 +1706,22 @@ async function pollGeneration(genId) {
   setTimeout(poll, INTERVAL);
 }
 
-const VIEW_LABELS = { isometric: 'Top View', front: 'Front View', corner: 'Corner View' };
-const VIEW_ORDER  = ['isometric', 'front', 'corner'];
+const VIEW_LABELS = { isometric: 'Top View', front: 'Front View', corner: 'Corner View', elevation: 'Wall Elevation' };
+const VIEW_ORDER  = ['isometric', 'front', 'corner', 'elevation'];
+
+// Lightbox: clicking a result image opens it full-screen
+function openLightbox(src) {
+  let lb = document.getElementById('img-lightbox');
+  if (!lb) {
+    lb = document.createElement('div');
+    lb.id = 'img-lightbox';
+    const img = document.createElement('img');
+    lb.appendChild(img);
+    lb.addEventListener('click', () => lb.remove());
+    document.body.appendChild(lb);
+  }
+  lb.querySelector('img').src = src;
+}
 
 function buildCarousel(images, prefix) {
   const views = VIEW_ORDER.filter(k => images[k]);
@@ -892,18 +1731,16 @@ function buildCarousel(images, prefix) {
   const wrap = document.createElement('div');
   wrap.className = 'carousel-wrap';
 
+  // Header row: label + nav (when multiple views)
+  const headerRow = document.createElement('div');
+  headerRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;';
+
   const label = document.createElement('div');
   label.className = 'carousel-label';
 
-  const imgEl = document.createElement('img');
-  imgEl.className = 'carousel-img';
-
-  const dlLink = document.createElement('a');
-  dlLink.className = 'carousel-dl';
-  dlLink.textContent = '⬇ Download';
-
   const nav = document.createElement('div');
   nav.className = 'carousel-nav';
+  nav.style.display = views.length > 1 ? '' : 'none';
 
   const prevBtn = document.createElement('button');
   prevBtn.className = 'carousel-btn';
@@ -917,7 +1754,38 @@ function buildCarousel(images, prefix) {
   nextBtn.textContent = '›';
 
   nav.append(prevBtn, counter, nextBtn);
-  wrap.append(label, imgEl, dlLink, nav);
+  headerRow.append(label, nav);
+
+  // Image with hover hint
+  const imgWrap = document.createElement('div');
+  imgWrap.className = 'carousel-img-wrap';
+
+  const imgEl = document.createElement('img');
+  imgEl.className = 'carousel-img';
+
+  const hint = document.createElement('div');
+  hint.className = 'carousel-expand-hint';
+  hint.textContent = 'Click to expand';
+
+  imgWrap.append(imgEl, hint);
+  imgWrap.addEventListener('click', () => openLightbox(imgEl.src));
+
+  // Actions row
+  const actions = document.createElement('div');
+  actions.className = 'carousel-actions';
+
+  const dlLink = document.createElement('a');
+  dlLink.className = 'carousel-dl';
+  dlLink.textContent = '⬇ Download';
+  dlLink.target = '_blank';
+
+  const openLink = document.createElement('a');
+  openLink.className = 'carousel-open';
+  openLink.textContent = '↗ Full size';
+  openLink.target = '_blank';
+
+  actions.append(dlLink, openLink);
+  wrap.append(headerRow, imgWrap, actions);
 
   function show(i) {
     idx = (i + views.length) % views.length;
@@ -926,13 +1794,14 @@ function buildCarousel(images, prefix) {
     imgEl.src = images[key];
     dlLink.href = images[key];
     dlLink.download = `${prefix}_${key}.png`;
+    openLink.href = images[key];
     counter.textContent = `${idx + 1} / ${views.length}`;
     prevBtn.disabled = views.length <= 1;
     nextBtn.disabled = views.length <= 1;
   }
 
-  prevBtn.addEventListener('click', () => show(idx - 1));
-  nextBtn.addEventListener('click', () => show(idx + 1));
+  prevBtn.addEventListener('click', e => { e.stopPropagation(); show(idx - 1); });
+  nextBtn.addEventListener('click', e => { e.stopPropagation(); show(idx + 1); });
   show(0);
   return wrap;
 }
@@ -944,7 +1813,11 @@ function showResult(images) {
   const container = resultImg.parentElement;
   container.querySelectorAll('.carousel-wrap').forEach(el => el.remove());
   const carousel = buildCarousel(images, 'generated');
-  if (carousel) container.appendChild(carousel);
+  if (carousel) {
+    container.appendChild(carousel);
+    // Scroll sidebar to show the result
+    resultSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
 }
 
 // ── Mode tab switching ─────────────────────────────────────────
@@ -1117,7 +1990,7 @@ btnFpGenerate.addEventListener('click', async () => {
 
 async function pollFpGeneration(genId) {
   const INTERVAL = 2500;
-  const MAX_WAIT = 5 * 60 * 1000;
+  const MAX_WAIT = 10 * 60 * 1000;
   const start = Date.now();
 
   const poll = async () => {
@@ -1225,6 +2098,99 @@ function renderSampleImages() {
       }
     });
     container.appendChild(div);
+  });
+}
+
+// ── Compose Room ───────────────────────────────────────────────
+const btnCompose = document.getElementById('btn-compose');
+if (btnCompose) {
+  btnCompose.addEventListener('click', async () => {
+    if (btnCompose.disabled || S.isComposing) return;
+
+    const floorImgs = S.generatedImages['floor'];
+    const floorUrl = floorImgs ? (floorImgs.isometric || Object.values(floorImgs)[0]) : null;
+    if (!floorUrl) { setStatus('Generate the floor first', 'error'); return; }
+
+    const wallImageUrls = [];
+    for (const [key, imgs] of Object.entries(S.generatedImages)) {
+      if (!key.startsWith('wall_')) continue;
+      const wallId = parseInt(key.slice(5));
+      const wall = S.walls.find(w => w.id === wallId);
+      const url = imgs.elevation || imgs.isometric || Object.values(imgs)[0];
+      if (url) {
+        wallImageUrls.push({
+          url,
+          wall_id: wallId,
+          label: wall ? `${wall.lengthM.toFixed(1)}m wall` : `Wall ${wallId}`,
+          width_m: wall ? wall.lengthM : null,
+          height_m: DEFAULT_WALL_H,
+        });
+      }
+    }
+    if (wallImageUrls.length === 0) { setStatus('Generate at least one wall first', 'error'); return; }
+
+    const xs = S.drawPoints.map(p => p.x);
+    const ys = S.drawPoints.map(p => p.y);
+    const roomDimensions = {
+      width: xs.length ? (Math.max(...xs) - Math.min(...xs)) / SCALE : 0,
+      height: ys.length ? (Math.max(...ys) - Math.min(...ys)) / SCALE : 0,
+      wall_height: DEFAULT_WALL_H,
+      unit: 'm',
+    };
+
+    S.isComposing = true;
+    updateComposeBtn();
+    setStatus('Composing room… this may take a minute', 'processing');
+    resultSection.style.display = 'none';
+
+    let genId;
+    try {
+      const res = await fetch('/api/compose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ floor_image_url: floorUrl, wall_image_urls: wallImageUrls, room_dimensions: roomDimensions, presets: {} }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      genId = data.gen_id;
+    } catch (err) {
+      setStatus(`Failed to start composition: ${err.message}`, 'error');
+      S.isComposing = false;
+      updateComposeBtn();
+      return;
+    }
+
+    // Poll using the same mechanism as regular generation
+    const INTERVAL = 2000;
+    const MAX_WAIT = 10 * 60 * 1000;
+    const start = Date.now();
+    const poll = async () => {
+      if (Date.now() - start > MAX_WAIT) {
+        setStatus('Composition timed out', 'error');
+        S.isComposing = false;
+        updateComposeBtn();
+        return;
+      }
+      try {
+        const res = await fetch(`/api/generate/${genId}`);
+        const data = await res.json();
+        if (data.status === 'success') {
+          setStatus('Room composition complete!', 'success');
+          S.isComposing = false;
+          updateComposeBtn();
+          showResult(data.result_images || { isometric: data.result_image });
+        } else if (data.status === 'failed') {
+          setStatus(`Composition failed: ${data.reason || 'unknown error'}`, 'error');
+          S.isComposing = false;
+          updateComposeBtn();
+        } else {
+          setTimeout(poll, INTERVAL);
+        }
+      } catch {
+        setTimeout(poll, INTERVAL);
+      }
+    };
+    setTimeout(poll, INTERVAL);
   });
 }
 
