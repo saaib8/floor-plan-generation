@@ -17,6 +17,8 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 
+from placement_categories import categories_for_surface
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,12 +47,21 @@ def _get_conn():
 # Public query functions
 # ---------------------------------------------------------------------------
 
+def _surface_category_clause(surface: Optional[str]) -> tuple[str, list]:
+    """SQL fragment + params restricting products to floor or wall categories."""
+    allowed = categories_for_surface(surface)
+    if not allowed:
+        return "", []
+    return " AND lower(p.category) = ANY(%s)", [sorted(allowed)]
+
+
 def get_products(
     allowed_keys: set[str],
     category: Optional[str] = None,
     search: Optional[str] = None,
     store_id: Optional[int] = None,
     limit: int = 200,
+    surface: Optional[str] = None,
 ) -> list[dict]:
     """Return a list of product dicts matching the filters.
 
@@ -81,6 +92,10 @@ def get_products(
     """
     params: list = [list(allowed_keys)]
 
+    surface_sql, surface_params = _surface_category_clause(surface)
+    sql += surface_sql
+    params.extend(surface_params)
+
     if category == "uncategorized":
         sql += " AND (p.category IS NULL OR p.category = '')"
     elif category:
@@ -104,7 +119,7 @@ def get_products(
             return [dict(row) for row in cur.fetchall()]
 
 
-def get_categories(allowed_keys: set[str]) -> list[dict]:
+def get_categories(allowed_keys: set[str], surface: Optional[str] = None) -> list[dict]:
     """Return [{category, count}] for products that have an icon in S3."""
     if not allowed_keys:
         return []
@@ -116,11 +131,16 @@ def get_categories(allowed_keys: set[str]) -> list[dict]:
           AND p.two_d_icon IS NOT NULL
           AND p.two_d_icon != ''
           AND p.two_d_icon = ANY(%s)
-        GROUP BY p.category
     """
+    params: list = [list(allowed_keys)]
+    surface_sql, surface_params = _surface_category_clause(surface)
+    sql += surface_sql
+    params.extend(surface_params)
+    sql += " GROUP BY p.category"
+
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, [list(allowed_keys)])
+            cur.execute(sql, params)
             return [dict(row) for row in cur.fetchall()]
 
 

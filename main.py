@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from db import get_categories as db_get_categories
 from db import get_product_two_d_icon, get_products as db_get_products
+from placement_categories import normalize_surface
 from generation import generate_floor_plan, generate_product_placement, generate_room_composition
 from models import (
     ComposeRequest, FloorPlanRequest, GenerationRequest,
@@ -160,9 +161,12 @@ def get_products(
     category: str | None = Query(default=None),
     search: str | None = Query(default=None),
     store_id: int | None = Query(default=None),
+    surface: str | None = Query(default=None, description="'floor' or 'wall'"),
     limit: int = Query(default=200, ge=1, le=500),
 ):
     try:
+        if surface and not normalize_surface(surface):
+            raise HTTPException(status_code=400, detail="surface must be 'floor' or 'wall'")
         existing_icon_keys = _existing_s3_icon_keys()
         rows = db_get_products(
             allowed_keys=existing_icon_keys,
@@ -170,6 +174,7 @@ def get_products(
             search=search,
             store_id=store_id,
             limit=limit,
+            surface=surface,
         )
         return [_row_to_payload(row) for row in rows]
     except Exception as exc:
@@ -178,10 +183,14 @@ def get_products(
 
 
 @app.get("/api/categories")
-def get_categories():
+def get_categories(
+    surface: str | None = Query(default=None, description="'floor' or 'wall'"),
+):
     try:
+        if surface and not normalize_surface(surface):
+            raise HTTPException(status_code=400, detail="surface must be 'floor' or 'wall'")
         existing_icon_keys = _existing_s3_icon_keys()
-        rows = db_get_categories(allowed_keys=existing_icon_keys)
+        rows = db_get_categories(allowed_keys=existing_icon_keys, surface=surface)
 
         counts: dict[str, int] = {}
         for row in rows:

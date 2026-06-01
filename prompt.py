@@ -566,12 +566,20 @@ def _compute_spatial_spec(payload: dict) -> str:
         if near_wall_gaps:
             any_near_wall_gap = True
             for key, gap in near_wall_gaps:
-                wall_name = _WALL_NAMES[key]
-                lines.append(
-                    f"    GAP to {wall_name} wall = {gap:.2f}m — this gap is INTENTIONAL. "
-                    f"Do NOT push this product against the {wall_name} wall. "
-                    f"Maintain visible floor/space ({gap:.1f}m ≈ {gap / (room_l if key in ('n', 's') else room_w) * 100:.0f}% of room {'depth' if key in ('n', 's') else 'width'}) between the product edge and the wall."
-                )
+                if key == "nearest":
+                    # Polygon room — no cardinal direction available
+                    lines.append(
+                        f"    GAP to nearest wall = {gap:.2f}m — this gap is INTENTIONAL. "
+                        f"Do NOT push this product flush against the wall. "
+                        f"Maintain visible floor/space of {gap:.2f}m between the product edge and the wall."
+                    )
+                else:
+                    wall_name = _WALL_NAMES[key]
+                    lines.append(
+                        f"    GAP to {wall_name} wall = {gap:.2f}m — this gap is INTENTIONAL. "
+                        f"Do NOT push this product against the {wall_name} wall. "
+                        f"Maintain visible floor/space ({gap:.1f}m ≈ {gap / (room_l if key in ('n', 's') else room_w) * 100:.0f}% of room {'depth' if key in ('n', 's') else 'width'}) between the product edge and the wall."
+                    )
 
         if not touching and not near_wall_gaps:
             lines.append(f"    Free-standing (well away from all walls). Footprint: {footprint_pct:.1f}% of floor, {width_pct:.0f}% of room width.")

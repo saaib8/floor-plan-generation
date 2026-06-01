@@ -73,6 +73,7 @@ const c2placeholder = document.getElementById('c2-placeholder');
 const c2label = document.getElementById('c2-label');
 const statusBar = document.getElementById('status-bar');
 const catalogList = document.getElementById('catalog-list');
+const catalogSurfaceHint = document.getElementById('catalog-surface-hint');
 const categorySelect = document.getElementById('category-select');
 const productSearch = document.getElementById('product-search');
 const productSelect = document.getElementById('product-select');
@@ -575,6 +576,7 @@ function selectWall(wall) {
   } else {
     resultSection.style.display = 'none';
   }
+  refreshCatalogForSurface();
 }
 
 function selectFloor() {
@@ -633,6 +635,7 @@ function selectFloor() {
   } else {
     resultSection.style.display = 'none';
   }
+  refreshCatalogForSurface();
 }
 
 // ── Surface info ───────────────────────────────────────────────
@@ -1753,23 +1756,66 @@ document.addEventListener('keydown', e => {
 });
 
 // ── Catalog / sidebar ──────────────────────────────────────────
+function catalogSurfaceType() {
+  return S.selectedSurface && S.selectedSurface.type === 'wall' ? 'wall' : (
+    S.selectedSurface && S.selectedSurface.type === 'floor' ? 'floor' : null
+  );
+}
+
+function showCatalogPlaceholder(message) {
+  S.categories = [];
+  S.products = [];
+  S.selectedCategory = '';
+  S.selectedProductId = '';
+  if (catalogSurfaceHint) catalogSurfaceHint.textContent = message;
+  categorySelect.innerHTML = `<option value="">${message}</option>`;
+  categorySelect.disabled = true;
+  productSelect.innerHTML = '<option value="">—</option>';
+  productSelect.disabled = true;
+  productSearch.disabled = true;
+  catalogList.innerHTML = `<div style="font-size:12px;color:var(--text-muted);padding:8px">${message}</div>`;
+}
+
 async function loadCatalog() {
+  const surface = catalogSurfaceType();
+  if (!surface) {
+    showCatalogPlaceholder('Select a floor or wall in Canvas 1 to browse products');
+    return;
+  }
+
+  categorySelect.disabled = false;
+  productSelect.disabled = false;
+  productSearch.disabled = false;
+  if (catalogSurfaceHint) {
+    catalogSurfaceHint.textContent = surface === 'wall'
+      ? 'Wall-mounted products only (art, shelves, clocks, lights…)'
+      : 'Floor-standing products only (furniture, rugs, tables…)';
+  }
+  categorySelect.innerHTML = '<option value="">Loading categories…</option>';
+  catalogList.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px">Loading products…</div>';
+
   try {
-    const res = await fetch('/api/categories');
+    const res = await fetch(`/api/categories?surface=${encodeURIComponent(surface)}`);
     if (!res.ok) throw new Error(await res.text());
     S.categories = await res.json();
     renderCategorySelect();
 
+    const surfaceLabel = surface === 'wall' ? 'wall' : 'floor';
     if (S.categories.length) {
       S.selectedCategory = S.categories[0].category;
       categorySelect.value = S.selectedCategory;
       await loadProductsForCategory();
     } else {
-      catalogList.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px">No products with 2D SVG icons found.</div>';
+      catalogList.innerHTML = `<div style="font-size:12px;color:var(--text-muted);padding:8px">No ${surfaceLabel} products with 2D icons found.</div>`;
+      productSelect.innerHTML = '<option value="">No products</option>';
     }
   } catch (err) {
-    catalogList.innerHTML = `<div style="font-size:12px;color:var(--danger);padding:8px">Failed to load DB products: ${err.message || err}</div>`;
+    catalogList.innerHTML = `<div style="font-size:12px;color:var(--danger);padding:8px">Failed to load products: ${err.message || err}</div>`;
   }
+}
+
+function refreshCatalogForSurface() {
+  loadCatalog();
 }
 
 function renderCategorySelect() {
@@ -1788,7 +1834,11 @@ function renderCategorySelect() {
 }
 
 async function loadProductsForCategory() {
+  const surface = catalogSurfaceType();
+  if (!surface) return;
+
   const params = new URLSearchParams();
+  params.set('surface', surface);
   if (S.selectedCategory) params.set('category', S.selectedCategory);
   const search = productSearch.value.trim();
   if (search) params.set('search', search);
@@ -2597,6 +2647,6 @@ if (btnCompose) {
 }
 
 // ── Init ───────────────────────────────────────────────────────
-loadCatalog();
+showCatalogPlaceholder('Select a floor or wall in Canvas 1 to browse products');
 resizeCanvases();
 renderSampleImages();
