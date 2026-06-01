@@ -157,9 +157,11 @@ def _product_to_payload(product) -> dict:
     width_m = _to_meters(product.width, product.dimension_unit)
     dimensions = None
     if length_m and width_m:
+        # length = product's long dimension (along the wall, canvas X-axis)
+        # width  = product's short dimension (depth from the wall, canvas Y-axis)
         dimensions = {
-            "width": width_m,
-            "depth": length_m,
+            "width": length_m,
+            "depth": width_m,
         }
 
     product_id = product.id
