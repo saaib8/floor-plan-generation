@@ -237,10 +237,6 @@ def _assign_guide_colors(products: list) -> list:
     result = []
     for i, p in enumerate(products):
         p = dict(p)
-        if not p.get("hex_color"):
-            p["hex_color"] = _GUIDE_GRAYS[i % len(_GUIDE_GRAYS)]
-        # Always override with neutral gray — even if frontend sent a color,
-        # we don't want saturated guide colors influencing the render.
         p["hex_color"] = _GUIDE_GRAYS[i % len(_GUIDE_GRAYS)]
         result.append(p)
     return result
@@ -349,8 +345,8 @@ def _make_floor_plan_guide(payload: dict, canvas_size: int = 1024) -> bytes:
         lw, lh = bbox_lbl[2] - bbox_lbl[0], bbox_lbl[3] - bbox_lbl[1]
         cx = (r[0] + r[2]) / 2
         cy = (r[1] + r[3]) / 2
-        # Only draw label if it fits
-        if lw < abs(r[2] - r[0]) - 2 or lh < abs(r[3] - r[1]) - 2:
+        # Only draw label if it fits in both dimensions
+        if lw < abs(r[2] - r[0]) - 2 and lh < abs(r[3] - r[1]) - 2:
             draw.text((cx - lw / 2, cy - lh / 2), lbl, fill=text_color, font=opening_label_font)
 
     # Fonts for labels
@@ -1230,36 +1226,64 @@ def generate_room_composition(
     room_dimensions: Optional[Dict] = None,
     presets: Optional[Dict] = None,
     base_dir: Optional[str] = None,
-) -> bytes:
-    """Compose a final isometric room view from a floor image and one or more wall images.
+) -> Dict[str, bytes]:
+    """Generate isometric compositions from two opposite corners.
+
+    Returns {"sw": bytes, "ne": bytes}:
+      sw — camera at SW corner looking NE; shows NORTH + EAST walls.
+      ne — camera at NE corner looking SW; shows SOUTH + WEST walls.
 
     floor_image_url: server-relative path like "/outputs/xxx_isometric.png"
-    wall_image_urls: list of {url, label, width_m, height_m}
-    base_dir: filesystem root to resolve server-relative URLs (defaults to generation.py parent)
+    wall_image_urls: list of {url, label, width_m, height_m} — label must be a compass
+                     direction ("north", "south", "east", "west").
     """
     root = Path(base_dir) if base_dir else Path(__file__).parent
 
     def _resolve(url: str) -> bytes:
         path = root / url.lstrip("/")
-        if path.exists():
+        if path.exists() and path.is_file():
             return _sanitize_image_bytes(path.read_bytes())
-        return _sanitize_image_bytes(download_bytes(url))
+        if url.startswith("http://") or url.startswith("https://"):
+            return _sanitize_image_bytes(download_bytes(url))
+        raise FileNotFoundError(f"Image not found at local path: {path}")
 
     floor_bytes = _resolve(floor_image_url)
 
-    wall_labels: List[str] = []
-    wall_bytes_list: List[bytes] = []
+    # Build compass → bytes mapping from the provided wall elevation images
+    wall_map: Dict[str, bytes] = {}
     for wi in wall_image_urls:
-        wall_bytes_list.append(_resolve(wi["url"]))
-        wall_labels.append(wi.get("label") or f"Wall {wi.get('wall_id', '?')}")
+        label = (wi.get("label") or "").lower().strip()
+        if label:
+            wall_map[label] = _resolve(wi["url"])
 
-    image_bytes_list = [floor_bytes] + wall_bytes_list
+    # Each corner view sees exactly 2 walls; order defines IMAGE 2, IMAGE 3
+    _CORNER_WALLS = {
+        "sw": ["north", "east"],
+        "ne": ["south", "west"],
+    }
 
-    prompt = build_composition_prompt(
-        room_dimensions=room_dimensions or {},
-        wall_labels=wall_labels,
-        presets=presets or {},
-        n_walls=len(wall_bytes_list),
-    )
-    logger.info("Composition prompt %d chars, %d images", len(prompt), len(image_bytes_list))
-    return _openai_product_placement_edit(prompt, image_bytes_list)
+    def _gen_corner(corner: str) -> tuple:
+        ordered = _CORNER_WALLS[corner]
+        corner_labels = [w for w in ordered if w in wall_map]
+        images = [floor_bytes] + [wall_map[w] for w in corner_labels]
+        prompt = build_composition_prompt(
+            room_dimensions=room_dimensions or {},
+            wall_labels=corner_labels,
+            presets=presets or {},
+            n_walls=len(corner_labels),
+            corner=corner,
+        )
+        logger.info(
+            "Composition %s corner: walls=%s prompt=%d chars images=%d",
+            corner, corner_labels, len(prompt), len(images),
+        )
+        return corner, _openai_product_placement_edit(prompt, images)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_gen_corner, c) for c in ("sw", "ne")]
+        results: Dict[str, bytes] = {}
+        for f in as_completed(futures):
+            corner_name, img_bytes = f.result()
+            results[corner_name] = img_bytes
+
+    return results

@@ -97,5 +97,14 @@
     "image_url": "/products/icons/art_canvas.svg",
     "dims": "0.6 x 0.8",
     "dimensions": { "width": 0.6, "depth": 0.05, "height": 0.8 }
+  },
+  {
+    "id": 12,
+    "name": "Laundry Basket",
+    "category": "Laundry Basket",
+    "icon": "/products/icons/laundary.svg",
+    "image_url": "/products/icons/laundry_basket.svg",
+    "dims": "0.5 x 0.5",
+    "dimensions": { "width": 0.5, "depth": 0.5, "height": 0.5 }
   }
 ]

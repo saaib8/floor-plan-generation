@@ -1162,7 +1162,7 @@ def build_wall_plan_prompt(
     )
     if n_openings:
         constraints += (
-            f"\n(6) Render all {n_openings} opening(s) as simple, plain doors/windows — "
+            f"\n(7) Render all {n_openings} opening(s) as simple, plain doors/windows — "
             "no extra hardware or decorative panels beyond what the guide shows."
         )
 
@@ -1172,62 +1172,145 @@ def build_wall_plan_prompt(
     ])).strip() + "\n\nOutput: one photorealistic front-facing wall elevation render, no overlays, no on-image text."
 
 
+_CORNER_CFG = {
+    "sw": {
+        "camera_desc": "SOUTH-WEST corner, looking diagonally toward the NORTH-EAST interior",
+        "visible_walls": {
+            "north": "the BACK wall — runs horizontally left-to-right at the far end of the room",
+            "east":  "the RIGHT-SIDE wall — runs diagonally from the back-right corner toward the front-right",
+        },
+        "hidden_walls": ["south", "west"],
+    },
+    "ne": {
+        "camera_desc": "NORTH-EAST corner, looking diagonally toward the SOUTH-WEST interior",
+        "visible_walls": {
+            "south": "the BACK wall — runs horizontally left-to-right at the far end of the room from this angle",
+            "west":  "the LEFT-SIDE wall — runs diagonally from the back-left corner toward the front-left",
+        },
+        "hidden_walls": ["north", "east"],
+    },
+}
+
+
 def build_composition_prompt(
     room_dimensions: Optional[Dict] = None,
     wall_labels: Optional[List[str]] = None,
     presets: Optional[Dict] = None,
     n_walls: int = 0,
+    corner: str = "sw",
 ) -> str:
-    """Prompt for the final isometric room composition from floor + wall reference images."""
+    """Prompt for one corner view of the final isometric room composition.
+
+    corner:      "sw" (camera at SW, shows NORTH + EAST walls)
+                 "ne" (camera at NE, shows SOUTH + WEST walls)
+    wall_labels: compass labels for the walls provided in this corner (IMAGE 2, 3, …).
+    """
     rd = room_dimensions or {}
     w = float(rd.get("width") or 0)
-    d = float(rd.get("height") or rd.get("depth") or 0)
+    d = float(rd.get("depth") or rd.get("length") or 0)
     wall_h = float(rd.get("wall_height") or 2.8)
     unit = rd.get("unit", "m")
 
-    if w and d:
-        room_desc = f"{w:.1f} × {d:.1f} × {wall_h:.1f} {unit} (width × depth × height)"
-    else:
-        room_desc = "see reference images for proportions"
-
-    wall_refs = "\n".join(
-        f"- IMAGE {i + 2}: Front elevation of {wall_labels[i] if wall_labels and i < len(wall_labels) else f'wall {i+1}'}"
-        for i in range(n_walls)
+    room_desc = (
+        f"{w:.1f} × {d:.1f} × {wall_h:.1f} {unit} (width × depth × height)"
+        if w and d else "see IMAGE 1 for proportions"
     )
 
     pr = presets or {}
-    style_parts = []
-    if pr.get("room_type"):
-        style_parts.append(pr["room_type"])
-    if pr.get("decor_style"):
-        style_parts.append(pr["decor_style"])
+    wall_color = pr.get("wall_color", "#F3EFE8")
+    style_parts = [s for s in [pr.get("room_type"), pr.get("decor_style")] if s]
     style_line = ("Style: " + ", ".join(style_parts) + ".") if style_parts else ""
 
+    cfg = _CORNER_CFG[corner]
+    camera_desc = cfg["camera_desc"]
+    visible_map = cfg["visible_walls"]        # compass → visual description
+    hidden_walls = cfg["hidden_walls"]        # walls NOT visible from this corner
+
+    provided_labels = [l.lower().strip() for l in (wall_labels or [])]
+
+    # ── Per-wall sections for walls that have elevation images ─────────────────
+    wall_sections: List[str] = []
+    for i, label in enumerate(provided_labels):
+        visual = visible_map.get(label, f"the {label.upper()} wall")
+        wall_sections.append(
+            f"IMAGE {i + 2} → {label.upper()} wall ({visual})\n"
+            f"  Copy this elevation EXACTLY onto that wall surface:\n"
+            f"  • Same products at the same left-right positions and heights from floor\n"
+            f"  • Same openings (door/window) at the same positions\n"
+            f"  • Same wall colour/finish\n"
+            f"  • Do NOT move any product to a different wall"
+        )
+
+    # ── Visible walls with NO elevation → plain surface ────────────────────────
+    no_elevation_visible = [
+        w for w in visible_map if w not in provided_labels
+    ]
+    plain_visible_text = ""
+    if no_elevation_visible:
+        plain_list = ", ".join(
+            f"{w.upper()} ({visible_map[w]})" for w in no_elevation_visible
+        )
+        plain_visible_text = (
+            f"## Visible walls with NO elevation provided\n"
+            f"{plain_list}\n"
+            f"Render as plain {wall_color} painted surfaces — NO products, NO openings. "
+            f"Do NOT invent anything on these walls."
+        )
+
+    # ── Walls not visible from this corner ─────────────────────────────────────
+    hidden_text = (
+        f"## Walls NOT visible from this corner\n"
+        f"{', '.join(w.upper() for w in hidden_walls)}\n"
+        f"These walls are at the camera position. Do NOT render them."
+    )
+
+    wall_sections_block = "\n\n".join(wall_sections)
+
     return f"""## Task
-Create ONE photorealistic isometric interior room view that composites all provided reference surfaces into a single coherent scene.
-Every surface must faithfully reflect its reference image — same materials, same furniture, same openings.
+Produce ONE photorealistic isometric room render from the {camera_desc}.
+
+Use IMAGE 1 for the floor layout. Use IMAGE 2+ for the wall surfaces.
+Render naturally from this corner angle — partial wall views at the edges are acceptable.
 {style_line}
 
 ## Room dimensions
 {room_desc}
 
-## Reference images provided
-- IMAGE 1: Top-down isometric view of the floor — ground truth for furniture layout, floor material, and product positions
-{wall_refs}
+## Camera position
+Camera at the {camera_desc}.
+Match the isometric angle, height, and zoom from IMAGE 1.
 
-## Composition rules
-1. Render in a 3/4 isometric perspective (camera ~30–45° above, angled toward the front corner of the room so floor and two walls are visible)
-2. The floor must match IMAGE 1 exactly: same furniture, same positions, same floor material/texture
-3. Each wall must match its reference elevation: same openings (windows/doors at the same positions), same wall finish, same any furniture placed against it
-4. Maintain correct proportions based on room dimensions: {room_desc}
-5. Consistent lighting — soft ambient light from above, shadows matching the isometric camera angle
-6. Walls and floor meet at correct 90° angles; no distortion
+## Walls visible from this corner
+{chr(10).join(f"- {w.upper()} wall: {desc}" for w, desc in visible_map.items())}
 
-## Hard constraints
-- No new furniture, accessories, or architectural elements beyond what appears in the reference images
-- No text, labels, dimension lines, or watermarks on the output
-- All provided surfaces (floor + {n_walls} wall(s)) must be visible and correctly oriented
-- Photorealistic render quality — no cartoon or sketch style
+## IMAGE 1 — floor furniture reference
+IMAGE 1 is a floor-only render. Use it for:
+- Positions, sizes, and orientations of all floor-standing furniture
+- Floor material, room proportions, camera angle
+Note: the walls in IMAGE 1 are blank — they were not part of the floor canvas.
+Apply the wall content from the elevation images below instead.
+
+## Wall elevation images
+
+{wall_sections_block if wall_sections_block else "(No wall elevations for this corner.)"}
+
+{plain_visible_text}
+
+{hidden_text}
+
+## Rendering approach
+1. Use IMAGE 1's isometric camera angle.
+2. Reproduce the floor furniture from IMAGE 1 at their exact positions.
+3. For each visible wall that has an elevation image: apply those wall products and openings to that wall surface. Products that appear at the edge of the view may be partially cropped — that is fine.
+4. For visible walls without an elevation: render as plain {wall_color} painted surface.
+5. Wall products stay on their own wall; floor products stay on the floor.
+6. Soft ambient lighting consistent with IMAGE 1.
+
+## Constraints
+- Do not move floor furniture from IMAGE 1's positions
+- Do not add products or openings to walls without elevation images
+- Do not invent any furniture, accessories, or architectural elements
+- No text, labels, or watermarks
 
 Output: a single photorealistic isometric room render, no overlays, no on-image text.
 """.strip()

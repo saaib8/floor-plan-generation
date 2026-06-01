@@ -384,20 +384,25 @@ async def start_composition(request: ComposeRequest):
 
 def _run_composition(gen_id: str, payload: dict):
     try:
-        result_bytes = generate_room_composition(
+        results = generate_room_composition(
             floor_image_url=payload["floor_image_url"],
             wall_image_urls=[dict(wi) for wi in payload["wall_image_urls"]],
             room_dimensions=payload.get("room_dimensions"),
             presets=payload.get("presets"),
             base_dir=str(BASE_DIR),
         )
-        output_path = OUTPUT_DIR / f"{gen_id}_composition.png"
-        output_path.write_bytes(result_bytes)
-        url = f"/outputs/{gen_id}_composition.png"
+        paths: dict = {}
+        for corner_name, img_bytes in results.items():
+            out_path = OUTPUT_DIR / f"{gen_id}_composition_{corner_name}.png"
+            out_path.write_bytes(img_bytes)
+            paths[f"composition_{corner_name}"] = f"/outputs/{gen_id}_composition_{corner_name}.png"
+
+        # SW corner is the primary (standard hero view)
+        primary = paths.get("composition_sw") or next(iter(paths.values()))
         _generations[gen_id]["status"] = "success"
-        _generations[gen_id]["result_image"] = url
-        _generations[gen_id]["result_images"] = {"isometric": url}
-        logger.info("Composition %s completed", gen_id)
+        _generations[gen_id]["result_image"] = primary
+        _generations[gen_id]["result_images"] = paths
+        logger.info("Composition %s completed: %s", gen_id, list(paths.keys()))
     except Exception as e:
         logger.error("Composition %s failed: %s", gen_id, e, exc_info=True)
         _generations[gen_id]["status"] = "failed"

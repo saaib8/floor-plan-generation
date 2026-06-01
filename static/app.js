@@ -46,6 +46,7 @@ const S = {
   selectedCategory: '',
   selectedProductId: '',
   generatedImages: {},  // { 'floor': {isometric,...}, 'wall_3': {elevation,...}, ... }
+  compositeImages: null, // { composition_sw, composition_ne } — shown in its own section
 };
 
 let wallIdSeq = 0;
@@ -86,6 +87,8 @@ const infoHeight = document.getElementById('info-height');
 const resultSection = document.getElementById('result-section');
 const resultImg = document.getElementById('result-img');
 const resultDownload = document.getElementById('result-download');
+const compositeSection = document.getElementById('composite-section');
+const compositeImgWrap = document.getElementById('composite-img-wrap');
 const openingsSection = document.getElementById('openings-section');
 const openingsList = document.getElementById('openings-list');
 const noOpeningsMsg = document.getElementById('no-openings-msg');
@@ -1302,6 +1305,7 @@ document.getElementById('tool-clear').addEventListener('click', () => {
   S.draggingOpening = null;
   S.colorIdx = 0;
   S.generatedImages = {};
+  S.compositeImages = null;
   S.surfaceLayouts = {};
   S.isComposing = false;
   wallIdSeq = 0;
@@ -1322,6 +1326,8 @@ document.getElementById('tool-clear').addEventListener('click', () => {
   updateGenerateBtn();
   updateComposeBtn();
   resultSection.style.display = 'none';
+  compositeSection.style.display = 'none';
+  compositeImgWrap.querySelectorAll('.carousel-wrap').forEach(el => el.remove());
   renderSurface();
   drawCanvas1();
   setStatus('Ready', '');
@@ -1819,6 +1825,10 @@ btnGenerate.addEventListener('click', async () => {
     openings,
   };
 
+  // Capture the surface being generated NOW, so the async result is filed
+  // under the correct surface even if the user switches selection mid-generation.
+  const surfaceKey = currentSurfaceKey();
+
   S.isGenerating = true;
   btnGenerate.disabled = true;
   setStatus('Starting generation…', 'processing');
@@ -1843,10 +1853,10 @@ btnGenerate.addEventListener('click', async () => {
   }
 
   // Poll
-  pollGeneration(genId);
+  pollGeneration(genId, surfaceKey);
 });
 
-async function pollGeneration(genId) {
+async function pollGeneration(genId, surfaceKey) {
   const INTERVAL = 2000;
   const MAX_WAIT = 10 * 60 * 1000; // 10 min
   const start = Date.now();
@@ -1868,14 +1878,18 @@ async function pollGeneration(genId) {
         S.isGenerating = false;
         updateGenerateBtn();
         const images = data.result_images || { isometric: data.result_image };
-        // Store result keyed by current surface so it persists across surface switches
-        const key = currentSurfaceKey();
+        // Store result under the surface that was active when generation STARTED,
+        // not whatever is selected now (the user may have switched mid-generation).
+        const key = surfaceKey || currentSurfaceKey();
         if (key) {
           S.generatedImages[key] = images;
           drawCanvas1();
           updateComposeBtn();
         }
-        showResult(images);
+        // Only swap the visible result if the user is still on that surface.
+        if (!key || currentSurfaceKey() === key) {
+          showResult(images);
+        }
       } else if (data.status === 'failed') {
         setStatus(`Generation failed: ${data.reason || 'unknown error'}`, 'error');
         S.isGenerating = false;
@@ -1891,8 +1905,12 @@ async function pollGeneration(genId) {
   setTimeout(poll, INTERVAL);
 }
 
-const VIEW_LABELS = { isometric: 'Top View', elevation: 'Wall Elevation' };
+const VIEW_LABELS = {
+  isometric: 'Top View', elevation: 'Wall Elevation',
+  composition_sw: 'SW Corner', composition_ne: 'NE Corner',
+};
 const VIEW_ORDER  = ['isometric', 'elevation'];
+const COMPOSITE_ORDER = ['composition_sw', 'composition_ne'];
 
 // Lightbox: clicking a result image opens it full-screen
 function openLightbox(src) {
@@ -1908,8 +1926,8 @@ function openLightbox(src) {
   lb.querySelector('img').src = src;
 }
 
-function buildCarousel(images, prefix) {
-  const views = VIEW_ORDER.filter(k => images[k]);
+function buildCarousel(images, prefix, order = VIEW_ORDER) {
+  const views = order.filter(k => images[k]);
   if (!views.length) return null;
   let idx = 0;
 
@@ -2003,6 +2021,18 @@ function showResult(images) {
     // Scroll sidebar to show the result
     resultSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
+}
+
+function showCompositeResult(images) {
+  compositeImgWrap.querySelectorAll('.carousel-wrap').forEach(el => el.remove());
+  const carousel = buildCarousel(images, 'composite', COMPOSITE_ORDER);
+  if (!carousel) {
+    compositeSection.style.display = 'none';
+    return;
+  }
+  compositeSection.style.display = '';
+  compositeImgWrap.appendChild(carousel);
+  compositeSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 // ── Mode tab switching ─────────────────────────────────────────
@@ -2363,7 +2393,9 @@ if (btnCompose) {
           setStatus('Room composition complete!', 'success');
           S.isComposing = false;
           updateComposeBtn();
-          showResult(data.result_images || { isometric: data.result_image });
+          const composite = data.result_images || { composition_sw: data.result_image };
+          S.compositeImages = composite;
+          showCompositeResult(composite);
         } else if (data.status === 'failed') {
           setStatus(`Composition failed: ${data.reason || 'unknown error'}`, 'error');
           S.isComposing = false;
