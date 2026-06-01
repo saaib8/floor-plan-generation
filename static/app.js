@@ -42,6 +42,9 @@ const S = {
   isGenerating: false,
   isComposing: false,
   products: [],
+  categories: [],
+  selectedCategory: '',
+  selectedProductId: '',
   generatedImages: {},  // { 'floor': {isometric,...}, 'wall_3': {elevation,...}, ... }
 };
 
@@ -69,6 +72,9 @@ const c2placeholder = document.getElementById('c2-placeholder');
 const c2label = document.getElementById('c2-label');
 const statusBar = document.getElementById('status-bar');
 const catalogList = document.getElementById('catalog-list');
+const categorySelect = document.getElementById('category-select');
+const productSearch = document.getElementById('product-search');
+const productSelect = document.getElementById('product-select');
 const placedList = document.getElementById('placed-list');
 const btnGenerate = document.getElementById('btn-generate');
 const noPlacedMsg = document.getElementById('no-placed-msg');
@@ -87,18 +93,80 @@ const btnAddDoor = document.getElementById('btn-add-door');
 const btnAddWindow = document.getElementById('btn-add-window');
 
 // ── Resize canvases ────────────────────────────────────────────
+function setCanvasBackingSize(canvas, ctx, width, height) {
+  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
+  const logicalW = Math.max(1, Math.floor(width));
+  const logicalH = Math.max(1, Math.floor(height));
+  const backingW = Math.floor(logicalW * dpr);
+  const backingH = Math.floor(logicalH * dpr);
+
+  canvas._logicalWidth = logicalW;
+  canvas._logicalHeight = logicalH;
+  canvas.style.width = `${logicalW}px`;
+  canvas.style.height = `${logicalH}px`;
+
+  if (canvas.width !== backingW || canvas.height !== backingH) {
+    canvas.width = backingW;
+    canvas.height = backingH;
+  }
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+}
+
+function canvasLogicalSize(canvas) {
+  return {
+    width: canvas._logicalWidth || canvas.width,
+    height: canvas._logicalHeight || canvas.height,
+  };
+}
+
+function drawImagePreserveAspect(ctx, img, x, y, boxW, boxH) {
+  const naturalW = img.naturalWidth || img.width || 1;
+  const naturalH = img.naturalHeight || img.height || 1;
+  const aspect = naturalW / naturalH || 1;
+  const pad = Math.min(5, Math.max(1, Math.min(boxW, boxH) * 0.025));
+  const availW = Math.max(1, boxW - pad * 2);
+  const availH = Math.max(1, boxH - pad * 2);
+  const boxAspect = availW / availH;
+
+  let drawW;
+  let drawH;
+  if (boxAspect > aspect) {
+    drawH = availH;
+    drawW = drawH * aspect;
+  } else {
+    drawW = availW;
+    drawH = drawW / aspect;
+  }
+
+  // If product dimensions are unusually skinny/wide, pure contain makes the SVG tiny.
+  // Grow the visual icon by area while preserving aspect ratio, allowing slight overflow.
+  const fillRatio = (drawW * drawH) / (availW * availH);
+  if (fillRatio < 0.55) {
+    const targetArea = availW * availH * 0.72;
+    let grownW = Math.sqrt(targetArea * aspect);
+    let grownH = Math.sqrt(targetArea / aspect);
+    const maxW = availW * 1.28;
+    const maxH = availH * 1.28;
+    const scale = Math.min(maxW / grownW, maxH / grownH, 1);
+    drawW = grownW * scale;
+    drawH = grownH * scale;
+  }
+
+  ctx.drawImage(img, x + (boxW - drawW) / 2, y + (boxH - drawH) / 2, drawW, drawH);
+}
+
 function resizeCanvases() {
   const r1 = c1wrap.getBoundingClientRect();
   const r2 = c2wrap.getBoundingClientRect();
   const hdr = 28; // panel header height
-  c1.width  = Math.floor(r1.width);
-  c1.height = Math.floor(r1.height) - hdr;
-  c2.width  = Math.floor(r2.width);
-  c2.height = Math.floor(r2.height) - hdr;
+  setCanvasBackingSize(c1, ctx1, r1.width, r1.height - hdr);
+  setCanvasBackingSize(c2, ctx2, r2.width, r2.height - hdr);
   if (copWrap.style.display !== 'none') {
     const rop = copWrap.getBoundingClientRect();
-    cOP.width  = Math.floor(rop.width);
-    cOP.height = Math.floor(rop.height) - hdr;
+    setCanvasBackingSize(cOP, ctxOP, rop.width, rop.height - hdr);
     renderWallPreview();
   }
   drawCanvas1();
@@ -146,7 +214,7 @@ function setStatus(msg, cls = '') {
 
 // ── Canvas 1 drawing ───────────────────────────────────────────
 function drawCanvas1() {
-  const W = c1.width, H = c1.height;
+  const { width: W, height: H } = canvasLogicalSize(c1);
   ctx1.clearRect(0, 0, W, H);
 
   // Grid
@@ -543,7 +611,7 @@ function updateSurfaceInfo() {
 
 // ── Canvas 2: render surface ───────────────────────────────────
 function renderSurface() {
-  const W = c2.width, H = c2.height;
+  const { width: W, height: H } = canvasLogicalSize(c2);
   ctx2.clearRect(0, 0, W, H);
   c2placeholder.style.display = 'none';
 
@@ -717,8 +785,8 @@ function renderSurface() {
     const cxMid = pp.cx + pp.wPx / 2;
     const cyMid = pp.cy + pp.hPx / 2;
 
-    // Colored fill rect (dimensions already reflect rotation via wPx/hPx swap)
-    ctx2.fillStyle = pp.color + 'cc';
+    // Light placement zone; keep the SVG itself visually dominant.
+    ctx2.fillStyle = pp.color + '22';
     ctx2.fillRect(pp.cx, pp.cy, pp.wPx, pp.hPx);
     ctx2.strokeStyle = pp.color;
     ctx2.lineWidth = 2;
@@ -727,22 +795,30 @@ function renderSurface() {
     // Product icon — draw rotated so orientation is visually correct
     if (pp.img) {
       ctx2.save();
+      ctx2.imageSmoothingEnabled = true;
+      ctx2.imageSmoothingQuality = 'high';
       ctx2.translate(cxMid, cyMid);
       ctx2.rotate(rot);
       // In rotated context, natural image dims are the pre-swap dimensions
       const imgW = (pp.rotation % 180 === 0) ? pp.wPx : pp.hPx;
       const imgH = (pp.rotation % 180 === 0) ? pp.hPx : pp.wPx;
-      const pad = 4;
-      ctx2.drawImage(pp.img, -(imgW / 2) + pad, -(imgH / 2) + pad, imgW - pad * 2, imgH - pad * 2);
+      drawImagePreserveAspect(ctx2, pp.img, -imgW / 2, -imgH / 2, imgW, imgH);
       ctx2.restore();
     }
 
     // Label + rotation badge
+    const label = pp.product.name;
+    const labelW = Math.min(pp.wPx - 8, Math.max(54, label.length * 5.2));
+    const labelH = 16;
+    ctx2.fillStyle = 'rgba(37,31,26,0.72)';
+    ctx2.beginPath();
+    ctx2.roundRect(cxMid - labelW / 2, pp.cy + pp.hPx - labelH - 4, labelW, labelH, 8);
+    ctx2.fill();
     ctx2.fillStyle = '#fff';
-    ctx2.font = 'bold 9px sans-serif';
+    ctx2.font = 'bold 8.5px sans-serif';
     ctx2.textAlign = 'center';
     ctx2.textBaseline = 'middle';
-    ctx2.fillText(pp.product.name, cxMid, cyMid);
+    ctx2.fillText(label, cxMid, pp.cy + pp.hPx - labelH / 2 - 4, labelW - 8);
     if (pp.rotation) {
       ctx2.font = '8px sans-serif';
       ctx2.fillStyle = 'rgba(0,0,0,0.6)';
@@ -770,7 +846,7 @@ const DOOR_H_M = 2.2;
 const WINDOW_H_M = 0.9;
 
 function renderWallPreview() {
-  const W = cOP.width, H = cOP.height;
+  const { width: W, height: H } = canvasLogicalSize(cOP);
   ctxOP.clearRect(0, 0, W, H);
   copPlaceholder.style.display = 'none';
 
@@ -1009,10 +1085,22 @@ function placeProduct(product, dropX, dropY) {
 
   // Preload icon image (for canvas display only)
   const img = new Image();
+  img.decoding = 'async';
   img.src = product.icon;
 
-  // imageUrl: the real product photo URL used for AI generation (not the SVG icon)
-  const pp = { id: ++placedIdSeq, product, color, cx, cy, wPx, hPx, img, imageUrl: '', rotation: 0 };
+  // imageUrl is the product photo used for AI generation; product.icon is the SVG used on the canvas.
+  const pp = {
+    id: ++placedIdSeq,
+    product,
+    color,
+    cx,
+    cy,
+    wPx,
+    hPx,
+    img,
+    imageUrl: product.image_url || '',
+    rotation: 0,
+  };
   img.onload = () => renderSurface();
 
   S.placedProducts.push(pp);
@@ -1075,7 +1163,7 @@ function updatePlacedList() {
         class="placed-img-url ${hasUrl ? 'has-url' : ''}"
         data-id="${pp.id}"
         type="url"
-        placeholder="Paste product photo URL (PNG/JPG)"
+        placeholder="Product photo URL for generation"
         value="${pp.imageUrl}"
       />
     `;
@@ -1493,17 +1581,85 @@ document.addEventListener('keydown', e => {
 // ── Catalog / sidebar ──────────────────────────────────────────
 async function loadCatalog() {
   try {
-    const res = await fetch('/api/products');
-    S.products = await res.json();
-    renderCatalog();
-  } catch {
-    catalogList.innerHTML = '<div style="font-size:12px;color:var(--danger);padding:8px">Failed to load products</div>';
+    const res = await fetch('/api/categories');
+    if (!res.ok) throw new Error(await res.text());
+    S.categories = await res.json();
+    renderCategorySelect();
+
+    if (S.categories.length) {
+      S.selectedCategory = S.categories[0].category;
+      categorySelect.value = S.selectedCategory;
+      await loadProductsForCategory();
+    } else {
+      catalogList.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px">No products with 2D SVG icons found.</div>';
+    }
+  } catch (err) {
+    catalogList.innerHTML = `<div style="font-size:12px;color:var(--danger);padding:8px">Failed to load DB products: ${err.message || err}</div>`;
   }
+}
+
+function renderCategorySelect() {
+  categorySelect.innerHTML = '';
+  if (!S.categories.length) {
+    categorySelect.innerHTML = '<option value="">No categories found</option>';
+    return;
+  }
+
+  S.categories.forEach(cat => {
+    const opt = document.createElement('option');
+    opt.value = cat.category;
+    opt.textContent = `${cat.category} (${cat.count})`;
+    categorySelect.appendChild(opt);
+  });
+}
+
+async function loadProductsForCategory() {
+  const params = new URLSearchParams();
+  if (S.selectedCategory) params.set('category', S.selectedCategory);
+  const search = productSearch.value.trim();
+  if (search) params.set('search', search);
+  params.set('limit', '500');
+
+  catalogList.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px">Loading products…</div>';
+  productSelect.innerHTML = '<option value="">Loading products…</option>';
+  S.selectedProductId = '';
+
+  const res = await fetch(`/api/products?${params.toString()}`);
+  if (!res.ok) throw new Error(await res.text());
+  S.products = await res.json();
+  renderProductSelect();
+  renderCatalog();
+}
+
+function renderProductSelect() {
+  productSelect.innerHTML = '';
+
+  const allOpt = document.createElement('option');
+  allOpt.value = '';
+  allOpt.textContent = S.products.length ? `All ${S.products.length} products` : 'No products found';
+  productSelect.appendChild(allOpt);
+
+  S.products.forEach(product => {
+    const opt = document.createElement('option');
+    opt.value = String(product.id);
+    opt.textContent = product.name;
+    productSelect.appendChild(opt);
+  });
 }
 
 function renderCatalog() {
   catalogList.innerHTML = '';
-  S.products.forEach(product => {
+
+  const products = S.selectedProductId
+    ? S.products.filter(product => String(product.id) === S.selectedProductId)
+    : S.products;
+
+  if (!products.length) {
+    catalogList.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px">No products match this filter.</div>';
+    return;
+  }
+
+  products.forEach(product => {
     const div = document.createElement('div');
     div.className = 'catalog-item';
     div.draggable = true;
@@ -1513,7 +1669,8 @@ function renderCatalog() {
       </div>
       <div class="info">
         <div class="name">${product.name}</div>
-        <div class="dims">${product.dims || ''}</div>
+        <div class="dims">${product.category || ''}${product.dims ? ' · ' + product.dims : ''}</div>
+        <div class="dims">${product.store_name || ''}</div>
       </div>
     `;
     div.addEventListener('dragstart', e => {
@@ -1524,6 +1681,33 @@ function renderCatalog() {
     catalogList.appendChild(div);
   });
 }
+
+categorySelect.addEventListener('change', async () => {
+  S.selectedCategory = categorySelect.value;
+  try {
+    await loadProductsForCategory();
+    setStatus(`Loaded ${S.products.length} ${S.selectedCategory} product(s)`, '');
+  } catch (err) {
+    catalogList.innerHTML = `<div style="font-size:12px;color:var(--danger);padding:8px">Failed to load products: ${err.message || err}</div>`;
+  }
+});
+
+let productSearchTimer = null;
+productSearch.addEventListener('input', () => {
+  clearTimeout(productSearchTimer);
+  productSearchTimer = setTimeout(async () => {
+    try {
+      await loadProductsForCategory();
+    } catch (err) {
+      catalogList.innerHTML = `<div style="font-size:12px;color:var(--danger);padding:8px">Failed to search products: ${err.message || err}</div>`;
+    }
+  }, 250);
+});
+
+productSelect.addEventListener('change', () => {
+  S.selectedProductId = productSelect.value;
+  renderCatalog();
+});
 
 // ── Top panel resize divider ───────────────────────────────────
 let _dividerActive = false;
@@ -1570,8 +1754,9 @@ function exportHighlightImage() {
   const t = c2._transform;
 
   // Scale factor from canvas2 space to 1024x1024
-  const sx = 1024 / c2.width;
-  const sy = 1024 / c2.height;
+  const { width: c2W, height: c2H } = canvasLogicalSize(c2);
+  const sx = 1024 / c2W;
+  const sy = 1024 / c2H;
 
   // White background (the wall/floor surface)
   oc2d.fillStyle = '#ffffff';

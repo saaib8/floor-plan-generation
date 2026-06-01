@@ -1,16 +1,17 @@
 import asyncio
 import base64
-import json
 import logging
 import os
+import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from generation import generate_floor_plan, generate_product_placement, generate_room_composition
@@ -19,7 +20,18 @@ from models import (
     GenerationStartResponse, GenerationStatusResponse,
 )
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = BASE_DIR.parents[1]
+
+# Reuse Mesaky backend environment for DB/S3, while letting this app's local
+# .env override OpenAI/Gemini/runtime values.
+load_dotenv(BACKEND_DIR / ".env")
+load_dotenv(BASE_DIR / ".env", override=True)
+
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "mesaky_backend.settings")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -32,7 +44,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).parent
 PRODUCTS_DIR = BASE_DIR / "products"
 OUTPUT_DIR = BASE_DIR / "outputs"
 TEST_IMAGES_DIR = BASE_DIR / "test_images"
@@ -47,6 +58,123 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 # In-memory generation state  {gen_id: {...}}
 _generations: dict = {}
 _executor = ThreadPoolExecutor(max_workers=4)
+_django_initialized = False
+_s3_icon_key_cache: dict = {"expires_at": 0, "keys": set()}
+
+
+def _ensure_django():
+    """Initialize Django lazily so this app reuses Mesaky DB/settings."""
+    global _django_initialized
+    if _django_initialized:
+        return
+
+    import django
+
+    django.setup()
+    _django_initialized = True
+
+
+def _product_model():
+    _ensure_django()
+    from core.models import Product
+
+    return Product
+
+
+def _icon_bucket() -> str:
+    return (
+        os.getenv("TWO_D_ICON_BUCKET")
+        or os.getenv("AWS_TEMPORARY_BUCKET_NAME")
+        or os.getenv("AWS_PUBLIC_BUCKET_NAME")
+        or "zory-temporary-uploads-backup"
+    )
+
+
+def _icon_prefixes() -> list[str]:
+    raw = os.getenv("TWO_D_ICON_PREFIXES") or os.getenv("TWO_D_ICON_PREFIX") or "2D_icons"
+    return [prefix.strip("/ ") for prefix in raw.split(",") if prefix.strip("/ ")]
+
+
+def _existing_s3_icon_keys() -> set[str]:
+    now = time.time()
+    if _s3_icon_key_cache["expires_at"] > now:
+        return _s3_icon_key_cache["keys"]
+
+    _ensure_django()
+    from core.utils.s3_helper import s3
+
+    bucket = _icon_bucket()
+    keys: set[str] = set()
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for prefix in _icon_prefixes():
+        page_iterator = paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/")
+        for page in page_iterator:
+            for obj in page.get("Contents", []):
+                key = obj.get("Key")
+                if key and not key.endswith("/"):
+                    keys.add(key)
+
+    _s3_icon_key_cache["keys"] = keys
+    _s3_icon_key_cache["expires_at"] = now + int(os.getenv("TWO_D_ICON_S3_CACHE_SECONDS", "300"))
+    return keys
+
+
+def _to_float(value):
+    return float(value) if value is not None else None
+
+
+def _to_meters(value, unit: str | None):
+    number = _to_float(value)
+    if number is None:
+        return None
+    normalized = (unit or "").strip().lower()
+    if normalized in {"cm", "centimeter", "centimeters"}:
+        return number / 100
+    if normalized in {"mm", "millimeter", "millimeters"}:
+        return number / 1000
+    # Most catalog data is in cm; guard against huge metre values when unit is missing.
+    if number > 20:
+        return number / 100
+    return number
+
+
+def _format_dims(length, width, unit):
+    length_f = _to_float(length)
+    width_f = _to_float(width)
+    if length_f is None or width_f is None:
+        return ""
+    suffix = unit or ""
+    return f"{length_f:g} x {width_f:g} {suffix}".strip()
+
+
+def _category_value(category: str | None) -> str:
+    return (category or "").strip() or "uncategorized"
+
+
+def _product_to_payload(product) -> dict:
+    length_m = _to_meters(product.length, product.dimension_unit)
+    width_m = _to_meters(product.width, product.dimension_unit)
+    dimensions = None
+    if length_m and width_m:
+        dimensions = {
+            "width": width_m,
+            "depth": length_m,
+        }
+
+    product_id = product.id
+    return {
+        "id": product_id,
+        "name": product.name_english or f"Product {product_id}",
+        "category": _category_value(product.category),
+        "store_id": product.store_id,
+        "store_name": getattr(product.store, "name_english", "") or "",
+        "icon": f"/api/products/{product_id}/icon",
+        "two_d_icon": product.two_d_icon or "",
+        "image_url": product.image_url or "",
+        "dims": _format_dims(product.length, product.width, product.dimension_unit),
+        "dimensions": dimensions,
+    }
 
 
 @app.get("/")
@@ -55,12 +183,119 @@ def root():
 
 
 @app.get("/api/products")
-def get_products():
-    catalog_path = PRODUCTS_DIR / "catalog.json"
-    if not catalog_path.exists():
-        return []
-    with open(catalog_path) as f:
-        return json.load(f)
+def get_products(
+    category: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    store_id: int | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    try:
+        Product = _product_model()
+        existing_icon_keys = _existing_s3_icon_keys()
+        if not existing_icon_keys:
+            return []
+
+        qs = (
+            Product.objects.filter(
+                is_active=True,
+                two_d_icon__isnull=False,
+                two_d_icon__in=existing_icon_keys,
+            )
+            .exclude(two_d_icon="")
+            .select_related("store")
+            .order_by("name_english")
+        )
+
+        if category:
+            if category == "uncategorized":
+                from django.db.models import Q
+
+                qs = qs.filter(Q(category__isnull=True) | Q(category=""))
+            else:
+                qs = qs.filter(category__iexact=category)
+        if search:
+            qs = qs.filter(name_english__icontains=search)
+        if store_id:
+            qs = qs.filter(store_id=store_id)
+
+        return [_product_to_payload(product) for product in qs[:limit]]
+    except Exception as exc:
+        logger.error("Failed to load DB products: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to load DB products: {exc}")
+
+
+@app.get("/api/categories")
+def get_categories():
+    try:
+        from django.db.models import Count
+
+        Product = _product_model()
+        existing_icon_keys = _existing_s3_icon_keys()
+        if not existing_icon_keys:
+            return []
+
+        rows = (
+            Product.objects.filter(
+                is_active=True,
+                two_d_icon__isnull=False,
+                two_d_icon__in=existing_icon_keys,
+            )
+            .exclude(two_d_icon="")
+            .values("category")
+            .annotate(count=Count("id"))
+        )
+        counts = {}
+        for row in rows:
+            category = _category_value(row["category"])
+            counts[category] = counts.get(category, 0) + row["count"]
+
+        return [
+            {"category": category, "count": count}
+            for category, count in sorted(counts.items(), key=lambda item: item[0].lower())
+        ]
+    except Exception as exc:
+        logger.error("Failed to load DB categories: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to load DB categories: {exc}")
+
+
+@app.get("/api/products/{product_id}/icon")
+def get_product_icon(product_id: int):
+    Product = _product_model()
+    product = (
+        Product.objects.filter(
+            id=product_id,
+            two_d_icon__isnull=False,
+        )
+        .exclude(two_d_icon="")
+        .only("two_d_icon")
+        .first()
+    )
+    if not product:
+        raise HTTPException(status_code=404, detail="Product icon not found")
+
+    key = product.two_d_icon
+    if key.startswith("http://") or key.startswith("https://"):
+        return RedirectResponse(key)
+    if key not in _existing_s3_icon_keys():
+        raise HTTPException(status_code=404, detail="Product icon key does not exist in S3")
+
+    try:
+        from core.utils.s3_helper import s3
+
+        obj = s3.get_object(Bucket=_icon_bucket(), Key=key)
+        body = obj["Body"].read()
+        content_type = obj.get("ContentType") or "image/svg+xml"
+        if key.lower().endswith(".svg"):
+            content_type = "image/svg+xml"
+    except Exception as exc:
+        logger.error("Failed to load product icon %s from S3 key %s: %s", product_id, key, exc, exc_info=True)
+        raise HTTPException(status_code=404, detail=f"Failed to load product icon from S3: {exc}")
+
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @app.post("/api/generate", response_model=GenerationStartResponse)
