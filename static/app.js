@@ -647,6 +647,41 @@ function updateSurfaceInfo() {
   }
 }
 
+// ── 1m metric grid helper ─────────────────────────────────────
+function _drawMetricGrid(ctx, ox, oy, surfW, surfH, sc, widthM, heightM, insideClip) {
+  const gridPx = sc; // 1 metre in canvas pixels
+
+  // Minor grid lines every 1m
+  ctx.strokeStyle = 'rgba(0,0,0,0.08)';
+  ctx.lineWidth = 0.5;
+  for (let mX = 1; mX < widthM; mX++) {
+    const x = ox + mX * gridPx;
+    ctx.beginPath(); ctx.moveTo(x, oy); ctx.lineTo(x, oy + surfH); ctx.stroke();
+  }
+  for (let mY = 1; mY < heightM; mY++) {
+    const y = oy + mY * gridPx;
+    ctx.beginPath(); ctx.moveTo(ox, y); ctx.lineTo(ox + surfW, y); ctx.stroke();
+  }
+
+  // Metre labels along top and left edges (only when not inside a clipping region)
+  if (!insideClip) {
+    ctx.fillStyle = 'rgba(100,90,80,0.55)';
+    ctx.font = '9px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    for (let mX = 1; mX < widthM; mX++) {
+      const x = ox + mX * gridPx;
+      ctx.fillText(`${mX}m`, x, oy - 2);
+    }
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (let mY = 1; mY < heightM; mY++) {
+      const y = oy + mY * gridPx;
+      ctx.fillText(`${mY}m`, ox - 4, y);
+    }
+  }
+}
+
 // ── Canvas 2: render surface ───────────────────────────────────
 function renderSurface() {
   const { width: W, height: H } = canvasLogicalSize(c2);
@@ -677,14 +712,9 @@ function renderSurface() {
   if (S.selectedSurface.type === 'wall') {
     ctx2.fillStyle = '#f5f2ee';
     ctx2.fillRect(ox, oy, surfW, surfH);
-    // subtle brick / plaster texture lines
-    ctx2.strokeStyle = '#e8e0d8';
-    ctx2.lineWidth = 0.5;
-    for (let y = oy + 30; y < oy + surfH; y += 30) {
-      ctx2.beginPath(); ctx2.moveTo(ox, y); ctx2.lineTo(ox + surfW, y); ctx2.stroke();
-    }
+    _drawMetricGrid(ctx2, ox, oy, surfW, surfH, sc, widthM, heightM, false);
   } else if (isPolygonRoom && polygonM) {
-    // Polygon floor: build path from polygon vertices, clip, draw tile pattern inside
+    // Polygon floor: clip to shape, then draw 1m metric grid inside
     ctx2.save();
     ctx2.beginPath();
     polygonM.forEach(([xM, yM], i) => {
@@ -692,23 +722,13 @@ function renderSurface() {
       if (i === 0) ctx2.moveTo(px, py); else ctx2.lineTo(px, py);
     });
     ctx2.closePath();
-    ctx2.clip();
-
-    // Tile pattern inside the clipped polygon
     ctx2.fillStyle = '#eeeae4';
-    ctx2.fillRect(ox, oy, surfW, surfH);
-    ctx2.strokeStyle = '#e0dbd4';
-    ctx2.lineWidth = 0.5;
-    const tile = 60;
-    for (let x = ox; x < ox + surfW; x += tile) {
-      ctx2.beginPath(); ctx2.moveTo(x, oy); ctx2.lineTo(x, oy + surfH); ctx2.stroke();
-    }
-    for (let y = oy; y < oy + surfH; y += tile) {
-      ctx2.beginPath(); ctx2.moveTo(ox, y); ctx2.lineTo(ox + surfW, y); ctx2.stroke();
-    }
+    ctx2.fill();
+    ctx2.clip();
+    _drawMetricGrid(ctx2, ox, oy, surfW, surfH, sc, widthM, heightM, true);
     ctx2.restore();
 
-    // Draw polygon border outside clip
+    // Polygon border
     ctx2.beginPath();
     polygonM.forEach(([xM, yM], i) => {
       const px = ox + xM * sc, py = oy + yM * sc;
@@ -719,20 +739,11 @@ function renderSurface() {
     ctx2.lineWidth = 1.5;
     ctx2.stroke();
   } else {
-    // Rectangular floor: light tile pattern
+    // Rectangular floor: fill + 1m metric grid
     ctx2.fillStyle = '#eeeae4';
     ctx2.fillRect(ox, oy, surfW, surfH);
-    ctx2.strokeStyle = '#e0dbd4';
-    ctx2.lineWidth = 0.5;
-    const tile = 60;
-    for (let x = ox; x < ox + surfW; x += tile) {
-      ctx2.beginPath(); ctx2.moveTo(x, oy); ctx2.lineTo(x, oy + surfH); ctx2.stroke();
-    }
-    for (let y = oy; y < oy + surfH; y += tile) {
-      ctx2.beginPath(); ctx2.moveTo(ox, y); ctx2.lineTo(ox + surfW, y); ctx2.stroke();
-    }
+    _drawMetricGrid(ctx2, ox, oy, surfW, surfH, sc, widthM, heightM, false);
 
-    // Border
     ctx2.strokeStyle = '#7a7068';
     ctx2.lineWidth = 1.5;
     ctx2.strokeRect(ox, oy, surfW, surfH);
@@ -911,40 +922,66 @@ function renderSurface() {
     ctx2.lineWidth = 2;
     ctx2.strokeRect(pp.cx, pp.cy, pp.wPx, pp.hPx);
 
-    // Product icon — draw rotated so orientation is visually correct
+    // Icon fills the bounding box edge-to-edge using contain (no crop, no blank gap).
+    // The box is sized from physical dimensions so it represents the real footprint;
+    // the icon is scaled to fit within it preserving its own aspect ratio.
     if (pp.img) {
       ctx2.save();
       ctx2.imageSmoothingEnabled = true;
       ctx2.imageSmoothingQuality = 'high';
       ctx2.translate(cxMid, cyMid);
       ctx2.rotate(rot);
-      // In rotated context, natural image dims are the pre-swap dimensions
       const imgW = (pp.rotation % 180 === 0) ? pp.wPx : pp.hPx;
       const imgH = (pp.rotation % 180 === 0) ? pp.hPx : pp.wPx;
-      drawImagePreserveAspect(ctx2, pp.img, -imgW / 2, -imgH / 2, imgW, imgH);
+      if (pp.img.complete && pp.img.naturalWidth) {
+        // Stretch icon to fill the bounding box with a small uniform padding.
+        const pad = Math.max(2, Math.min(imgW, imgH) * 0.04);
+        ctx2.drawImage(pp.img, -imgW / 2 + pad, -imgH / 2 + pad, imgW - pad * 2, imgH - pad * 2);
+      } else {
+        // Still loading — placeholder dot
+        ctx2.fillStyle = pp.color + '88';
+        ctx2.beginPath();
+        ctx2.arc(0, 0, Math.min(imgW, imgH) / 4, 0, Math.PI * 2);
+        ctx2.fill();
+      }
       ctx2.restore();
     }
 
-    // Label + rotation badge
-    const label = pp.product.name;
-    const labelW = Math.min(pp.wPx - 8, Math.max(54, label.length * 5.2));
-    const labelH = 16;
-    ctx2.fillStyle = 'rgba(37,31,26,0.72)';
-    ctx2.beginPath();
-    ctx2.roundRect(cxMid - labelW / 2, pp.cy + pp.hPx - labelH - 4, labelW, labelH, 8);
-    ctx2.fill();
-    ctx2.fillStyle = '#fff';
-    ctx2.font = 'bold 8.5px sans-serif';
-    ctx2.textAlign = 'center';
-    ctx2.textBaseline = 'middle';
-    ctx2.fillText(label, cxMid, pp.cy + pp.hPx - labelH / 2 - 4, labelW - 8);
+    // Dimension label: "W × D cm" below the bounding box
+    const dims = pp.product.dimensions || {};
+    const isWall = S.selectedSurface && S.selectedSurface.type === 'wall';
+    const dimA = parseFloat(dims.width) || 0;
+    const dimB = isWall
+      ? (parseFloat(dims.height) || parseFloat(dims.depth) || 0)
+      : (parseFloat(dims.depth)  || parseFloat(dims.height) || 0);
+    if (dimA && dimB) {
+      // Convert metres → cm for display
+      const aCm = Math.round(dimA * 100);
+      const bCm = Math.round(dimB * 100);
+      const dimLabel = `${aCm} × ${bCm} cm`;
+      ctx2.font = 'bold 8px sans-serif';
+      ctx2.textAlign = 'center';
+      ctx2.textBaseline = 'top';
+      const tw = ctx2.measureText(dimLabel).width + 8;
+      const tx = cxMid;
+      const ty = pp.cy + pp.hPx + 3;
+      ctx2.fillStyle = 'rgba(37,31,26,0.65)';
+      ctx2.beginPath();
+      ctx2.roundRect(tx - tw / 2, ty, tw, 13, 4);
+      ctx2.fill();
+      ctx2.fillStyle = '#fff';
+      ctx2.fillText(dimLabel, tx, ty + 2);
+    }
+
+    // Rotation badge (top-right corner of box)
     if (pp.rotation) {
       ctx2.font = '8px sans-serif';
       ctx2.fillStyle = 'rgba(0,0,0,0.6)';
       ctx2.fillRect(pp.cx + pp.wPx - 22, pp.cy + 2, 20, 12);
       ctx2.fillStyle = '#fff';
       ctx2.textAlign = 'center';
-      ctx2.fillText(`${pp.rotation}°`, pp.cx + pp.wPx - 12, pp.cy + 9);
+      ctx2.textBaseline = 'middle';
+      ctx2.fillText(`${pp.rotation}°`, pp.cx + pp.wPx - 12, pp.cy + 8);
     }
   });
 
@@ -1184,28 +1221,35 @@ function placeProduct(product, dropX, dropY) {
   const t = c2._transform;
   if (!t) return;
 
-  // Product pixel dimensions on canvas2
-  // Wall elevation: vertical axis = product standing height (height > depth > width)
-  // Floor plan:     vertical axis = room-depth footprint   (depth  > height > width)
+  // Box size = physical dimensions scaled to canvas.
+  // Wall surface: height axis = product standing height.
+  // Floor surface: height axis = product depth (footprint).
   const dims = product.dimensions || {};
-  const wM = dims.width || 1;
   const isWallSurface = S.selectedSurface && S.selectedSurface.type === 'wall';
+  const wM = parseFloat(dims.width)  || 1;
   const dM = isWallSurface
-    ? (dims.height || dims.depth || wM)
-    : (dims.depth  || dims.height || wM);
-  const wPx = Math.max(30, wM * t.sc);
-  const hPx = Math.max(30, dM * t.sc);
+    ? (parseFloat(dims.height) || parseFloat(dims.depth) || wM)
+    : (parseFloat(dims.depth)  || parseFloat(dims.height) || wM);
 
-  // Center drop point, clamp inside surface bounding box
+  let rawW = wM * t.sc;
+  let rawH = dM * t.sc;
+
+  // Proportional clamp: if either side would exceed 90% of the surface,
+  // scale BOTH sides down together so the aspect ratio is preserved.
+  const maxPx = Math.min(t.surfW, t.surfH) * 0.9;
+  const overflowScale = Math.min(1, maxPx / Math.max(rawW, rawH));
+  let wPx = Math.max(24, rawW * overflowScale);
+  let hPx = Math.max(24, rawH * overflowScale);
+
+  // Center drop point, clamped inside surface bounding box
   let cx = Math.max(t.ox, Math.min(t.ox + t.surfW - wPx, dropX - wPx / 2));
   let cy = Math.max(t.oy, Math.min(t.oy + t.surfH - hPx, dropY - hPx / 2));
 
-  // For polygon rooms: check if product center is inside polygon; fall back to centroid if not
+  // Polygon rooms: fall back to centroid if drop lands outside the polygon
   if (t.isPolygonRoom && t.polygonM) {
     const centerX = cx + wPx / 2;
     const centerY = cy + hPx / 2;
     if (!isInsideFloorSurface(centerX, centerY)) {
-      // Fall back to polygon centroid
       const centroid = t.polygonM.reduce(
         (acc, [px, py]) => [acc[0] + px, acc[1] + py],
         [0, 0]
@@ -1216,13 +1260,11 @@ function placeProduct(product, dropX, dropY) {
   }
 
   const color = pickColor();
-
-  // Preload icon image (for canvas display only)
   const img = new Image();
   img.decoding = 'async';
   img.src = product.icon;
 
-  // imageUrl is the product photo used for AI generation; product.icon is the SVG used on the canvas.
+  // imageUrl is the product photo used for AI generation; product.icon is the SVG for canvas.
   const pp = {
     id: ++placedIdSeq,
     product,
@@ -1343,7 +1385,6 @@ function updatePlacedList() {
             const centerX = pp.cx + pp.wPx / 2;
             const centerY = pp.cy + pp.hPx / 2;
             if (!isInsideFloorSurface(centerX, centerY)) {
-              // Move to polygon centroid
               const centroid = t.polygonM.reduce(
                 (acc, [px, py]) => [acc[0] + px, acc[1] + py],
                 [0, 0]
