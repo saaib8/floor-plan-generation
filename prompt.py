@@ -402,6 +402,18 @@ def _build_derived_view_prompt(
     )
 
 
+def _point_to_segment_distance(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+    """Compute minimum distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
+    dx, dy = x2 - x1, y2 - y1
+    len_sq = dx * dx + dy * dy
+    if len_sq == 0:
+        return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / len_sq))
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    return ((px - proj_x) ** 2 + (py - proj_y) ** 2) ** 0.5
+
+
 def _compute_spatial_spec(payload: dict) -> str:
     """Compute explicit wall-gap distances and asymmetry directives for each product.
 
@@ -424,21 +436,38 @@ def _compute_spatial_spec(payload: dict) -> str:
     if not products:
         return ""
 
+    # Detect polygon room
+    room_polygon = room.get("polygon")
+    is_polygon = (
+        room_polygon
+        and isinstance(room_polygon, list)
+        and len(room_polygon) >= 3
+    )
+
     room_area = room_w * room_l
 
-    # Room shape description
-    if room_w > room_l * 1.05:
-        shape = "wider than deep"
-    elif room_l > room_w * 1.05:
-        shape = "deeper than wide"
+    if is_polygon:
+        n_vertices = len(room_polygon)
+        header = (
+            f"Room shape: irregular polygon with {n_vertices} vertices "
+            f"(bounding box {room_w:.1f}m wide x {room_l:.1f}m deep, "
+            f"total bounding area {room_area:.1f} m2). "
+            f"The room is NOT rectangular — it has {n_vertices} walls forming an irregular shape."
+        )
     else:
-        shape = "roughly square"
+        # Room shape description
+        if room_w > room_l * 1.05:
+            shape = "wider than deep"
+        elif room_l > room_w * 1.05:
+            shape = "deeper than wide"
+        else:
+            shape = "roughly square"
 
-    ratio = max(room_w, room_l) / min(room_w, room_l) if min(room_w, room_l) > 0 else 1.0
-    header = (
-        f"Room shape: {shape} ({room_w:.1f}m wide x {room_l:.1f}m deep, "
-        f"ratio {ratio:.1f}:1), total floor area {room_area:.1f} m2."
-    )
+        ratio = max(room_w, room_l) / min(room_w, room_l) if min(room_w, room_l) > 0 else 1.0
+        header = (
+            f"Room shape: {shape} ({room_w:.1f}m wide x {room_l:.1f}m deep, "
+            f"ratio {ratio:.1f}:1), total floor area {room_area:.1f} m2."
+        )
 
     lines = ["SPATIAL PLACEMENT CONSTRAINTS:", header]
     any_asymmetric = False
@@ -469,30 +498,63 @@ def _compute_spatial_spec(payload: dict) -> str:
         cx = float(pos.get("x") or 0)
         cy = float(pos.get("y") or 0)
 
-        # Wall gaps (from product edge to room boundary)
-        gap_w = max(0, cx - half_w)           # west gap
-        gap_e = max(0, room_w - cx - half_w)  # east gap
-        gap_n = max(0, cy - half_d)           # north gap
-        gap_s = max(0, room_l - cy - half_d)  # south gap
-
-        gaps = {"w": gap_w, "e": gap_e, "n": gap_n, "s": gap_s}
-
-        touching = []
-        near_wall_gaps = []  # walls that are close but NOT touching — danger zone
-        for key, gap in gaps.items():
-            if gap <= wall_touch_threshold:
-                touching.append(_WALL_NAMES[key])
-            elif gap <= near_wall_threshold:
-                near_wall_gaps.append((key, gap))
-
         footprint_pct = (eff_w * eff_d) / room_area * 100 if room_area else 0
         width_pct = eff_w / room_w * 100 if room_w else 0
 
-        line = (
-            f"  {cat} (id={pid}): gaps W={gap_w:.2f}m, E={gap_e:.2f}m, "
-            f"N={gap_n:.2f}m, S={gap_s:.2f}m."
-        )
-        lines.append(line)
+        if is_polygon:
+            # Polygon room: compute distance to nearest wall segment
+            min_dist = float("inf")
+            for i in range(len(room_polygon)):
+                x1, y1 = float(room_polygon[i][0]), float(room_polygon[i][1])
+                x2, y2 = float(room_polygon[(i + 1) % len(room_polygon)][0]), float(room_polygon[(i + 1) % len(room_polygon)][1])
+                d = _point_to_segment_distance(cx, cy, x1, y1, x2, y2)
+                if d < min_dist:
+                    min_dist = d
+
+            # Subtract half-product to get edge-to-wall distance
+            nearest_wall_gap = max(0, min_dist - max(half_w, half_d))
+
+            line = (
+                f"  {cat} (id={pid}): nearest wall distance={nearest_wall_gap:.2f}m "
+                f"(polygon-shaped room). Footprint: {footprint_pct:.1f}% of bounding area."
+            )
+            lines.append(line)
+
+            touching = []
+            near_wall_gaps = []
+            if nearest_wall_gap <= wall_touch_threshold:
+                touching.append("nearest wall")
+            elif nearest_wall_gap <= near_wall_threshold:
+                near_wall_gaps.append(("nearest", nearest_wall_gap))
+
+            # Use rectangular gaps for asymmetry detection (still useful for bounding box)
+            gap_w = max(0, cx - half_w)
+            gap_e = max(0, room_w - cx - half_w)
+            gap_n = max(0, cy - half_d)
+            gap_s = max(0, room_l - cy - half_d)
+            gaps = {"w": gap_w, "e": gap_e, "n": gap_n, "s": gap_s}
+        else:
+            # Rectangular room: compute N/S/E/W gaps
+            gap_w = max(0, cx - half_w)           # west gap
+            gap_e = max(0, room_w - cx - half_w)  # east gap
+            gap_n = max(0, cy - half_d)           # north gap
+            gap_s = max(0, room_l - cy - half_d)  # south gap
+
+            gaps = {"w": gap_w, "e": gap_e, "n": gap_n, "s": gap_s}
+
+            touching = []
+            near_wall_gaps = []  # walls that are close but NOT touching — danger zone
+            for key, gap in gaps.items():
+                if gap <= wall_touch_threshold:
+                    touching.append(_WALL_NAMES[key])
+                elif gap <= near_wall_threshold:
+                    near_wall_gaps.append((key, gap))
+
+            line = (
+                f"  {cat} (id={pid}): gaps W={gap_w:.2f}m, E={gap_e:.2f}m, "
+                f"N={gap_n:.2f}m, S={gap_s:.2f}m."
+            )
+            lines.append(line)
 
         if touching:
             lines.append(
@@ -605,6 +667,15 @@ def build_floor_plan_prompt(
     walls_cfg = room.get("walls", {})
     lighting = payload.get("lighting", {})
 
+    # Detect polygon room
+    room_polygon = room.get("polygon")
+    is_polygon_room = (
+        room_polygon
+        and isinstance(room_polygon, list)
+        and len(room_polygon) >= 3
+    )
+    n_walls = len(room_polygon) if is_polygon_room else 4
+
     # ── English appearance paragraph — NO geometry, NO coordinates ───────────
     openings = payload.get("openings", [])
     has_openings = len(openings) > 0
@@ -693,7 +764,7 @@ def build_floor_plan_prompt(
             )
         else:
             ref_lines.append(
-                "- All four walls are SOLID with NO gaps — there are NO doors or windows in this room"
+                f"- All {n_walls} walls are SOLID with NO gaps — there are NO doors or windows in this room"
             )
         ref_lines.append(
             "- Neutral gray rectangles = exact product footprint positions (position, size, rotation all precise)"
@@ -917,7 +988,7 @@ def build_floor_plan_prompt(
     else:
         constraints += (
             f"(2) This room has ZERO openings — do NOT render any doors, windows, or skylights. "
-            f"All four walls must be completely SOLID with no gaps, no glass, no frames, no openings of any kind.\n"
+            f"All {n_walls} walls must be completely SOLID with no gaps, no glass, no frames, no openings of any kind.\n"
         )
     constraints += (
         f"(3) PRODUCT IDENTITY: Copy ONLY the named product from each reference photo. Ignore staging props visible in the photo. "
@@ -928,7 +999,21 @@ def build_floor_plan_prompt(
     if n_openings:
         constraints += f"\n(6) Render all {n_openings} opening(s) as simple, plain doors/windows in the correct walls — no extra hardware or decorative details."
 
-    return "\n\n".join(filter(None, [appearance, view_line, rotation_block, refs, identity_block, geometry_block, spatial_spec, correction_notes, openings_spec, constraints])).strip() + (
+    # Room shape description for polygon rooms
+    room_shape_block = ""
+    if is_polygon_room:
+        room_w_val = float(room.get("width") or 0)
+        room_l_val = float(room.get("length") or 0)
+        room_shape_block = (
+            f"ROOM SHAPE: This room is an irregular polygon with {n_walls} vertices — it is NOT a simple rectangle.\n"
+            f"The polygon vertices (in metres, origin at bounding-box top-left) are:\n"
+            f"  {json.dumps(room_polygon)}\n"
+            f"Bounding box: {room_w_val:.1f}m wide x {room_l_val:.1f}m deep.\n"
+            f"The room outline must follow this polygon shape exactly. Do NOT render a rectangular room.\n"
+            f"The floor plan guide (IMAGE 1) shows the polygon outline — match it precisely."
+        )
+
+    return "\n\n".join(filter(None, [appearance, view_line, room_shape_block, rotation_block, refs, identity_block, geometry_block, spatial_spec, correction_notes, openings_spec, constraints])).strip() + (
         "\n\nOutput: one photorealistic render, no overlays, no on-image text."
     )
 

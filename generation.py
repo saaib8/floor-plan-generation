@@ -288,27 +288,53 @@ def _make_floor_plan_guide(payload: dict, canvas_size: int = 1024) -> bytes:
     img = Image.new("RGB", (canvas_size, canvas_size), (255, 255, 255))
     draw = ImageDraw.Draw(img)
 
-    # Floor fill
-    draw.rectangle([ox, oy, ox + rw_px, oy + rh_px], fill=(240, 228, 210))
-
-    # 25%/50%/75% grid lines on both axes
-    grid_color = (210, 200, 185)
-    for pct in (0.25, 0.50, 0.75):
-        gx = ox + int(round(rw_px * pct))
-        gy = oy + int(round(rh_px * pct))
-        draw.line([(gx, oy), (gx, oy + rh_px)], fill=grid_color, width=1)
-        draw.line([(ox, gy), (ox + rw_px, gy)], fill=grid_color, width=1)
-
     # Wall thickness
     wall_cfg = room.get("walls", {})
     wall_t = max(6, int(round(float(wall_cfg.get("thickness") or 0.12) * ppm)))
     wall_fill = (55, 55, 55)
 
-    # Solid walls (draw as four rectangles)
-    draw.rectangle([ox - wall_t, oy - wall_t, ox + rw_px + wall_t, oy], fill=wall_fill)          # north
-    draw.rectangle([ox - wall_t, oy + rh_px, ox + rw_px + wall_t, oy + rh_px + wall_t], fill=wall_fill)  # south
-    draw.rectangle([ox - wall_t, oy - wall_t, ox, oy + rh_px + wall_t], fill=wall_fill)          # west
-    draw.rectangle([ox + rw_px, oy - wall_t, ox + rw_px + wall_t, oy + rh_px + wall_t], fill=wall_fill)  # east
+    # Check for polygon room shape (non-rectangular rooms with >4 walls)
+    room_polygon_m = room.get("polygon")  # list of [x_m, y_m] vertices
+    if room_polygon_m and isinstance(room_polygon_m, list) and len(room_polygon_m) >= 3:
+        # Convert polygon vertices from metres to pixel coordinates
+        poly_pts = []
+        for pt in room_polygon_m:
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                px = ox + float(pt[0]) * ppm
+                py = oy + float(pt[1]) * ppm
+                poly_pts.append((px, py))
+        if len(poly_pts) >= 3:
+            # Floor fill — polygon
+            draw.polygon(poly_pts, fill=(240, 228, 210))
+            # Wall outlines — thick lines along each polygon edge
+            for i in range(len(poly_pts)):
+                p1 = poly_pts[i]
+                p2 = poly_pts[(i + 1) % len(poly_pts)]
+                draw.line([p1, p2], fill=wall_fill, width=wall_t)
+        else:
+            # Malformed polygon — fall back to rectangle
+            draw.rectangle([ox, oy, ox + rw_px, oy + rh_px], fill=(240, 228, 210))
+            draw.rectangle([ox - wall_t, oy - wall_t, ox + rw_px + wall_t, oy], fill=wall_fill)
+            draw.rectangle([ox - wall_t, oy + rh_px, ox + rw_px + wall_t, oy + rh_px + wall_t], fill=wall_fill)
+            draw.rectangle([ox - wall_t, oy - wall_t, ox, oy + rh_px + wall_t], fill=wall_fill)
+            draw.rectangle([ox + rw_px, oy - wall_t, ox + rw_px + wall_t, oy + rh_px + wall_t], fill=wall_fill)
+    else:
+        # Standard rectangular room
+        draw.rectangle([ox, oy, ox + rw_px, oy + rh_px], fill=(240, 228, 210))
+
+        # 25%/50%/75% grid lines on both axes
+        grid_color = (210, 200, 185)
+        for pct in (0.25, 0.50, 0.75):
+            gx = ox + int(round(rw_px * pct))
+            gy = oy + int(round(rh_px * pct))
+            draw.line([(gx, oy), (gx, oy + rh_px)], fill=grid_color, width=1)
+            draw.line([(ox, gy), (ox + rw_px, gy)], fill=grid_color, width=1)
+
+        # Solid walls (draw as four rectangles)
+        draw.rectangle([ox - wall_t, oy - wall_t, ox + rw_px + wall_t, oy], fill=wall_fill)          # north
+        draw.rectangle([ox - wall_t, oy + rh_px, ox + rw_px + wall_t, oy + rh_px + wall_t], fill=wall_fill)  # south
+        draw.rectangle([ox - wall_t, oy - wall_t, ox, oy + rh_px + wall_t], fill=wall_fill)          # west
+        draw.rectangle([ox + rw_px, oy - wall_t, ox + rw_px + wall_t, oy + rh_px + wall_t], fill=wall_fill)  # east
 
     # Openings — cut gaps in walls and label them
     opening_label_font = _get_font(11)
@@ -374,10 +400,18 @@ def _make_floor_plan_guide(payload: dict, canvas_size: int = 1024) -> bytes:
         hw = plan_w * ppm / 2
         hd = plan_d * ppm / 2
 
-        x0 = max(float(ox), cx_px - hw)
-        y0 = max(float(oy), cy_px - hd)
-        x1 = min(float(ox + rw_px), cx_px + hw)
-        y1 = min(float(oy + rh_px), cy_px + hd)
+        # For polygon rooms: skip rectangular clamping, render at actual coordinates
+        # (frontend already constrains products inside the polygon)
+        if room_polygon_m and isinstance(room_polygon_m, list) and len(room_polygon_m) >= 3:
+            x0 = cx_px - hw
+            y0 = cy_px - hd
+            x1 = cx_px + hw
+            y1 = cy_px + hd
+        else:
+            x0 = max(float(ox), cx_px - hw)
+            y0 = max(float(oy), cy_px - hd)
+            x1 = min(float(ox + rw_px), cx_px + hw)
+            y1 = min(float(oy + rh_px), cy_px + hd)
 
         try:
             r, g, b = hex_to_rgb(p.get("hex_color") or "#888888")
@@ -789,15 +823,21 @@ def _batch_to_fp_payload(
         products.append(entry)
         image_order.append(pid)
 
+    room_dict = {
+        "width": w,
+        "length": h,
+        "height": 2.8,
+        "flooring": {"type": flooring_type, "material": flooring_material},
+        "walls": {"color": wall_color},
+    }
+    # Pass through polygon vertices for non-rectangular rooms
+    room_polygon = room_dimensions.get("polygon")
+    if room_polygon and isinstance(room_polygon, list) and len(room_polygon) >= 3:
+        room_dict["polygon"] = room_polygon
+
     payload = {
         "unit": unit,
-        "room": {
-            "width": w,
-            "length": h,
-            "height": 2.8,
-            "flooring": {"type": flooring_type, "material": flooring_material},
-            "walls": {"color": wall_color},
-        },
+        "room": room_dict,
         "openings": openings or [],
         "products": products,
         "lighting": {"type": lighting_type, "sun_direction": "north", "intensity": 0.85},
@@ -1098,17 +1138,40 @@ def _validate_and_clamp_wall_layout(payload: dict) -> dict:
     return payload
 
 
+def _point_in_polygon(x: float, y: float, polygon: list) -> bool:
+    """Ray-casting point-in-polygon test for [[x, y], ...] vertex list."""
+    inside = False
+    n = len(polygon)
+    j = n - 1
+    for i in range(n):
+        xi, yi = float(polygon[i][0]), float(polygon[i][1])
+        xj, yj = float(polygon[j][0]), float(polygon[j][1])
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
 def _validate_and_clamp_layout(payload: dict) -> dict:
     """Clamp every product position so its footprint stays inside the room.
 
     Modifies `payload` in-place and returns it for convenience.
     Logs a warning for every coordinate that was corrected.
+    For polygon rooms: check if product center is inside polygon; if not, clamp to
+    bounding box as fallback with warning log.
     """
     room = payload.get("room", {})
     room_w = float(room.get("width") or 0)
     room_l = float(room.get("length") or 0)
     if not room_w or not room_l:
         return payload
+
+    room_polygon = room.get("polygon")
+    has_polygon = (
+        room_polygon
+        and isinstance(room_polygon, list)
+        and len(room_polygon) >= 3
+    )
 
     for p in payload.get("products", []):
         dims = p.get("dimensions", {})
@@ -1125,17 +1188,32 @@ def _validate_and_clamp_layout(payload: dict) -> dict:
         x = float(pos.get("x") or 0)
         y = float(pos.get("y") or 0)
 
-        clamped_x = max(half_w, min(room_w - half_w, x))
-        clamped_y = max(half_d, min(room_l - half_d, y))
+        if has_polygon:
+            # Polygon room: check if center is inside polygon
+            if not _point_in_polygon(x, y, room_polygon):
+                # Fallback: clamp to bounding box
+                clamped_x = max(half_w, min(room_w - half_w, x))
+                clamped_y = max(half_d, min(room_l - half_d, y))
+                logger.warning(
+                    "Layout validation (polygon): product %s center (%.3f, %.3f) outside polygon, "
+                    "clamped to bbox (%.3f, %.3f)",
+                    p.get("id", "?"), x, y, clamped_x, clamped_y,
+                )
+                pos["x"] = round(clamped_x, 3)
+                pos["y"] = round(clamped_y, 3)
+        else:
+            # Rectangular room: standard bounding box clamping
+            clamped_x = max(half_w, min(room_w - half_w, x))
+            clamped_y = max(half_d, min(room_l - half_d, y))
 
-        if abs(clamped_x - x) > 0.001 or abs(clamped_y - y) > 0.001:
-            logger.warning(
-                "Layout validation: product %s clamped from (%.3f, %.3f) to (%.3f, %.3f) "
-                "to stay within room %.1f x %.1f",
-                p.get("id", "?"), x, y, clamped_x, clamped_y, room_w, room_l,
-            )
-            pos["x"] = round(clamped_x, 3)
-            pos["y"] = round(clamped_y, 3)
+            if abs(clamped_x - x) > 0.001 or abs(clamped_y - y) > 0.001:
+                logger.warning(
+                    "Layout validation: product %s clamped from (%.3f, %.3f) to (%.3f, %.3f) "
+                    "to stay within room %.1f x %.1f",
+                    p.get("id", "?"), x, y, clamped_x, clamped_y, room_w, room_l,
+                )
+                pos["x"] = round(clamped_x, 3)
+                pos["y"] = round(clamped_y, 3)
 
     return payload
 

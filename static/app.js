@@ -519,6 +519,30 @@ function pointInPolygon(x, y, pts) {
   return inside;
 }
 
+// Ray-casting point-in-polygon for [[x,y], ...] format (metres)
+function pointInPolygonM(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i][0], yi = poly[i][1];
+    const xj = poly[j][0], yj = poly[j][1];
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+// Check if a canvas2 pixel coordinate is inside the floor polygon (for polygon rooms)
+function isInsideFloorSurface(canvasX, canvasY) {
+  const t = c2._transform;
+  if (!t) return true;
+  if (!t.polygonM || !t.isPolygonRoom) return true; // rectangular — always inside if within bbox
+  // Convert canvas2 px to metres within the surface
+  const xM = (canvasX - t.ox) / t.sc;
+  const yM = (canvasY - t.oy) / t.sc;
+  return pointInPolygonM(xM, yM, t.polygonM);
+}
+
 function selectWall(wall) {
   saveSurfaceLayout();
   S.selectedSurface = {
@@ -558,13 +582,36 @@ function selectFloor() {
   // Compute bounding box of the floor polygon
   const xs = S.drawPoints.map(p => p.x);
   const ys = S.drawPoints.map(p => p.y);
-  const wM = (Math.max(...xs) - Math.min(...xs)) / SCALE;
-  const hM = (Math.max(...ys) - Math.min(...ys)) / SCALE;
+  const minX = Math.min(...xs), minY = Math.min(...ys);
+  const wM = (Math.max(...xs) - minX) / SCALE;
+  const hM = (Math.max(...ys) - minY) / SCALE;
+
+  // Normalized polygon vertices in metres, origin at bounding-box top-left
+  const polygonM = S.drawPoints.map(p => [(p.x - minX) / SCALE, (p.y - minY) / SCALE]);
+
+  // Detect if room is a non-rectangular polygon (more than 4 vertices, or 4 vertices that aren't axis-aligned)
+  let isPolygonRoom = false;
+  if (polygonM.length !== 4) {
+    isPolygonRoom = true;
+  } else {
+    // Check if 4-vertex polygon is axis-aligned rectangle
+    const edges = [];
+    for (let i = 0; i < 4; i++) {
+      const [x1, y1] = polygonM[i];
+      const [x2, y2] = polygonM[(i + 1) % 4];
+      const dx = Math.abs(x2 - x1), dy = Math.abs(y2 - y1);
+      edges.push(dx < 0.01 || dy < 0.01); // edge is axis-aligned
+    }
+    isPolygonRoom = !edges.every(Boolean);
+  }
+
   S.selectedSurface = {
     type: 'floor',
     widthM: wM,
     heightM: hM,
     polygon: S.drawPoints,
+    polygonM,
+    isPolygonRoom,
   };
   restoreSurfaceLayout('floor');
   // Hide wall elevation preview panel + divider, reset flex
@@ -633,8 +680,10 @@ function renderSurface() {
   const ox = (W - surfW) / 2;
   const oy = (H - surfH) / 2;
 
-  // Store transform for hit testing
-  c2._transform = { ox, oy, sc, surfW, surfH, widthM, heightM };
+  // Store transform for hit testing (include polygon data for polygon rooms)
+  const polygonM = S.selectedSurface.polygonM || null;
+  const isPolygonRoom = S.selectedSurface.isPolygonRoom || false;
+  c2._transform = { ox, oy, sc, surfW, surfH, widthM, heightM, polygonM, isPolygonRoom };
 
   // Surface background
   if (S.selectedSurface.type === 'wall') {
@@ -646,8 +695,18 @@ function renderSurface() {
     for (let y = oy + 30; y < oy + surfH; y += 30) {
       ctx2.beginPath(); ctx2.moveTo(ox, y); ctx2.lineTo(ox + surfW, y); ctx2.stroke();
     }
-  } else {
-    // Floor: light tile pattern
+  } else if (isPolygonRoom && polygonM) {
+    // Polygon floor: build path from polygon vertices, clip, draw tile pattern inside
+    ctx2.save();
+    ctx2.beginPath();
+    polygonM.forEach(([xM, yM], i) => {
+      const px = ox + xM * sc, py = oy + yM * sc;
+      if (i === 0) ctx2.moveTo(px, py); else ctx2.lineTo(px, py);
+    });
+    ctx2.closePath();
+    ctx2.clip();
+
+    // Tile pattern inside the clipped polygon
     ctx2.fillStyle = '#eeeae4';
     ctx2.fillRect(ox, oy, surfW, surfH);
     ctx2.strokeStyle = '#e0dbd4';
@@ -659,12 +718,37 @@ function renderSurface() {
     for (let y = oy; y < oy + surfH; y += tile) {
       ctx2.beginPath(); ctx2.moveTo(ox, y); ctx2.lineTo(ox + surfW, y); ctx2.stroke();
     }
-  }
+    ctx2.restore();
 
-  // Border
-  ctx2.strokeStyle = '#7a7068';
-  ctx2.lineWidth = 1.5;
-  ctx2.strokeRect(ox, oy, surfW, surfH);
+    // Draw polygon border outside clip
+    ctx2.beginPath();
+    polygonM.forEach(([xM, yM], i) => {
+      const px = ox + xM * sc, py = oy + yM * sc;
+      if (i === 0) ctx2.moveTo(px, py); else ctx2.lineTo(px, py);
+    });
+    ctx2.closePath();
+    ctx2.strokeStyle = '#7a7068';
+    ctx2.lineWidth = 1.5;
+    ctx2.stroke();
+  } else {
+    // Rectangular floor: light tile pattern
+    ctx2.fillStyle = '#eeeae4';
+    ctx2.fillRect(ox, oy, surfW, surfH);
+    ctx2.strokeStyle = '#e0dbd4';
+    ctx2.lineWidth = 0.5;
+    const tile = 60;
+    for (let x = ox; x < ox + surfW; x += tile) {
+      ctx2.beginPath(); ctx2.moveTo(x, oy); ctx2.lineTo(x, oy + surfH); ctx2.stroke();
+    }
+    for (let y = oy; y < oy + surfH; y += tile) {
+      ctx2.beginPath(); ctx2.moveTo(ox, y); ctx2.lineTo(ox + surfW, y); ctx2.stroke();
+    }
+
+    // Border
+    ctx2.strokeStyle = '#7a7068';
+    ctx2.lineWidth = 1.5;
+    ctx2.strokeRect(ox, oy, surfW, surfH);
+  }
 
   // Openings on floor surface edges
   if (S.selectedSurface.type === 'floor' && S.openings.length > 0) {
@@ -678,60 +762,104 @@ function renderSurface() {
     S.openings.forEach(op => {
       const wall = S.walls.find(w => w.id === op.wallId);
       if (!wall) return;
-      const compass = wallToCompass(wall);
-      // Compute opening center position along wall in canvas1 coords
-      const dx = wall.x2 - wall.x1, dy = wall.y2 - wall.y1;
-      const wallLen = Math.hypot(dx, dy);
-      const centerAlongWall = op.posAlongWall * wallLen;
-      const ptX = wall.x1 + (dx / wallLen) * centerAlongWall;
-      const ptY = wall.y1 + (dy / wallLen) * centerAlongWall;
-      const halfWPx = (op.widthM * SCALE) / 2;
 
       const color = op.type === 'door' ? '#E8D4B0' : '#A8CCE8';
       const borderColor = op.type === 'door' ? '#C0A070' : '#6898C0';
       const label = op.type === 'door' ? 'D' : 'W';
 
-      let rx, ry, rw, rh;
-      if (compass === 'north') {
-        const fracL = ((ptX - halfWPx) - minX) / roomWPx;
-        const fracR = ((ptX + halfWPx) - minX) / roomWPx;
-        rx = ox + fracL * surfW;
-        rw = (fracR - fracL) * surfW;
-        ry = oy - thick;
-        rh = thick * 2;
-      } else if (compass === 'south') {
-        const fracL = ((ptX - halfWPx) - minX) / roomWPx;
-        const fracR = ((ptX + halfWPx) - minX) / roomWPx;
-        rx = ox + fracL * surfW;
-        rw = (fracR - fracL) * surfW;
-        ry = oy + surfH - thick;
-        rh = thick * 2;
-      } else if (compass === 'west') {
-        const fracT = ((ptY - halfWPx) - minY) / roomHPx;
-        const fracB = ((ptY + halfWPx) - minY) / roomHPx;
-        rx = ox - thick;
-        rw = thick * 2;
-        ry = oy + fracT * surfH;
-        rh = (fracB - fracT) * surfH;
-      } else { // east
-        const fracT = ((ptY - halfWPx) - minY) / roomHPx;
-        const fracB = ((ptY + halfWPx) - minY) / roomHPx;
-        rx = ox + surfW - thick;
-        rw = thick * 2;
-        ry = oy + fracT * surfH;
-        rh = (fracB - fracT) * surfH;
+      if (isPolygonRoom && polygonM) {
+        // Polygon rooms: draw opening along actual wall edge in metres
+        const dx = wall.x2 - wall.x1, dy = wall.y2 - wall.y1;
+        const wallLen = Math.hypot(dx, dy);
+        if (wallLen === 0) return;
+        const ux = dx / wallLen, uy = dy / wallLen;
+        const nx = -uy, ny = ux; // perpendicular normal
+
+        const centerPx = op.posAlongWall * wallLen;
+        const halfWPx = (op.widthM * SCALE) / 2;
+        const startT = Math.max(0, centerPx - halfWPx);
+        const endT = Math.min(wallLen, centerPx + halfWPx);
+
+        // Convert wall points from canvas1 coords to canvas2 coords via metres
+        const s1x = ox + ((wall.x1 + ux * startT) - minX) / SCALE * sc;
+        const s1y = oy + ((wall.y1 + uy * startT) - minY) / SCALE * sc;
+        const e1x = ox + ((wall.x1 + ux * endT) - minX) / SCALE * sc;
+        const e1y = oy + ((wall.y1 + uy * endT) - minY) / SCALE * sc;
+        const nxPx = nx / SCALE * sc * thick * SCALE; // normal offset in canvas2 px
+        const nyPx = ny / SCALE * sc * thick * SCALE;
+        const normScale = thick;
+        const nnx = nx * normScale, nny = ny * normScale;
+
+        ctx2.beginPath();
+        ctx2.moveTo(s1x + nnx, s1y + nny);
+        ctx2.lineTo(e1x + nnx, e1y + nny);
+        ctx2.lineTo(e1x - nnx, e1y - nny);
+        ctx2.lineTo(s1x - nnx, s1y - nny);
+        ctx2.closePath();
+        ctx2.fillStyle = color;
+        ctx2.fill();
+        ctx2.strokeStyle = borderColor;
+        ctx2.lineWidth = 1;
+        ctx2.stroke();
+        // Label
+        const midX = (s1x + e1x) / 2, midY = (s1y + e1y) / 2;
+        ctx2.fillStyle = '#5a5048';
+        ctx2.font = 'bold 9px sans-serif';
+        ctx2.textAlign = 'center';
+        ctx2.textBaseline = 'middle';
+        ctx2.fillText(label, midX, midY);
+      } else {
+        // Rectangular rooms: use compass-based bounding-box edge mapping
+        const compass = wallToCompass(wall);
+        const dx = wall.x2 - wall.x1, dy = wall.y2 - wall.y1;
+        const wallLen = Math.hypot(dx, dy);
+        const centerAlongWall = op.posAlongWall * wallLen;
+        const ptX = wall.x1 + (dx / wallLen) * centerAlongWall;
+        const ptY = wall.y1 + (dy / wallLen) * centerAlongWall;
+        const halfWPx = (op.widthM * SCALE) / 2;
+
+        let rx, ry, rw, rh;
+        if (compass === 'north') {
+          const fracL = ((ptX - halfWPx) - minX) / roomWPx;
+          const fracR = ((ptX + halfWPx) - minX) / roomWPx;
+          rx = ox + fracL * surfW;
+          rw = (fracR - fracL) * surfW;
+          ry = oy - thick;
+          rh = thick * 2;
+        } else if (compass === 'south') {
+          const fracL = ((ptX - halfWPx) - minX) / roomWPx;
+          const fracR = ((ptX + halfWPx) - minX) / roomWPx;
+          rx = ox + fracL * surfW;
+          rw = (fracR - fracL) * surfW;
+          ry = oy + surfH - thick;
+          rh = thick * 2;
+        } else if (compass === 'west') {
+          const fracT = ((ptY - halfWPx) - minY) / roomHPx;
+          const fracB = ((ptY + halfWPx) - minY) / roomHPx;
+          rx = ox - thick;
+          rw = thick * 2;
+          ry = oy + fracT * surfH;
+          rh = (fracB - fracT) * surfH;
+        } else { // east
+          const fracT = ((ptY - halfWPx) - minY) / roomHPx;
+          const fracB = ((ptY + halfWPx) - minY) / roomHPx;
+          rx = ox + surfW - thick;
+          rw = thick * 2;
+          ry = oy + fracT * surfH;
+          rh = (fracB - fracT) * surfH;
+        }
+        ctx2.fillStyle = color;
+        ctx2.fillRect(rx, ry, rw, rh);
+        ctx2.strokeStyle = borderColor;
+        ctx2.lineWidth = 1;
+        ctx2.strokeRect(rx, ry, rw, rh);
+        // Label
+        ctx2.fillStyle = '#5a5048';
+        ctx2.font = 'bold 9px sans-serif';
+        ctx2.textAlign = 'center';
+        ctx2.textBaseline = 'middle';
+        ctx2.fillText(label, rx + rw / 2, ry + rh / 2);
       }
-      ctx2.fillStyle = color;
-      ctx2.fillRect(rx, ry, rw, rh);
-      ctx2.strokeStyle = borderColor;
-      ctx2.lineWidth = 1;
-      ctx2.strokeRect(rx, ry, rw, rh);
-      // Label
-      ctx2.fillStyle = '#5a5048';
-      ctx2.font = 'bold 9px sans-serif';
-      ctx2.textAlign = 'center';
-      ctx2.textBaseline = 'middle';
-      ctx2.fillText(label, rx + rw / 2, ry + rh / 2);
     });
   }
 
@@ -1080,9 +1208,24 @@ function placeProduct(product, dropX, dropY) {
   const wPx = Math.max(30, wM * t.sc);
   const hPx = Math.max(30, dM * t.sc);
 
-  // Center drop point, clamp inside surface
-  const cx = Math.max(t.ox, Math.min(t.ox + t.surfW - wPx, dropX - wPx / 2));
-  const cy = Math.max(t.oy, Math.min(t.oy + t.surfH - hPx, dropY - hPx / 2));
+  // Center drop point, clamp inside surface bounding box
+  let cx = Math.max(t.ox, Math.min(t.ox + t.surfW - wPx, dropX - wPx / 2));
+  let cy = Math.max(t.oy, Math.min(t.oy + t.surfH - hPx, dropY - hPx / 2));
+
+  // For polygon rooms: check if product center is inside polygon; fall back to centroid if not
+  if (t.isPolygonRoom && t.polygonM) {
+    const centerX = cx + wPx / 2;
+    const centerY = cy + hPx / 2;
+    if (!isInsideFloorSurface(centerX, centerY)) {
+      // Fall back to polygon centroid
+      const centroid = t.polygonM.reduce(
+        (acc, [px, py]) => [acc[0] + px, acc[1] + py],
+        [0, 0]
+      ).map(v => v / t.polygonM.length);
+      cx = Math.max(t.ox, Math.min(t.ox + t.surfW - wPx, t.ox + centroid[0] * t.sc - wPx / 2));
+      cy = Math.max(t.oy, Math.min(t.oy + t.surfH - hPx, t.oy + centroid[1] * t.sc - hPx / 2));
+    }
+  }
 
   const color = pickColor();
 
@@ -1132,8 +1275,19 @@ c2.addEventListener('mousemove', e => {
   if (!pp) return;
   const t = c2._transform;
   if (!t) return;
-  pp.cx = Math.max(t.ox, Math.min(t.ox + t.surfW - pp.wPx, x - S.draggingPlaced.offX));
-  pp.cy = Math.max(t.oy, Math.min(t.oy + t.surfH - pp.hPx, y - S.draggingPlaced.offY));
+  const newCx = Math.max(t.ox, Math.min(t.ox + t.surfW - pp.wPx, x - S.draggingPlaced.offX));
+  const newCy = Math.max(t.oy, Math.min(t.oy + t.surfH - pp.hPx, y - S.draggingPlaced.offY));
+
+  // For polygon rooms: reject move if product center would be outside polygon
+  if (t.isPolygonRoom && t.polygonM) {
+    const centerX = newCx + pp.wPx / 2;
+    const centerY = newCy + pp.hPx / 2;
+    if (!isInsideFloorSurface(centerX, centerY)) {
+      return; // keep previous position
+    }
+  }
+  pp.cx = newCx;
+  pp.cy = newCy;
   renderSurface();
 });
 
@@ -1196,6 +1350,20 @@ function updatePlacedList() {
         if (t) {
           pp.cx = Math.max(t.ox, Math.min(t.ox + t.surfW - pp.wPx, pp.cx));
           pp.cy = Math.max(t.oy, Math.min(t.oy + t.surfH - pp.hPx, pp.cy));
+          // For polygon rooms: verify center is still inside polygon after rotation
+          if (t.isPolygonRoom && t.polygonM) {
+            const centerX = pp.cx + pp.wPx / 2;
+            const centerY = pp.cy + pp.hPx / 2;
+            if (!isInsideFloorSurface(centerX, centerY)) {
+              // Move to polygon centroid
+              const centroid = t.polygonM.reduce(
+                (acc, [px, py]) => [acc[0] + px, acc[1] + py],
+                [0, 0]
+              ).map(v => v / t.polygonM.length);
+              pp.cx = Math.max(t.ox, Math.min(t.ox + t.surfW - pp.wPx, t.ox + centroid[0] * t.sc - pp.wPx / 2));
+              pp.cy = Math.max(t.oy, Math.min(t.oy + t.surfH - pp.hPx, t.oy + centroid[1] * t.sc - pp.hPx / 2));
+            }
+          }
         }
       }
       updatePlacedList();
@@ -1765,11 +1933,24 @@ function exportHighlightImage() {
   const sy = 1024 / c2H;
 
   // White background (the wall/floor surface)
-  oc2d.fillStyle = '#ffffff';
-  oc2d.fillRect(
-    t.ox * sx, t.oy * sy,
-    t.surfW * sx, t.surfH * sy
-  );
+  if (t.isPolygonRoom && t.polygonM) {
+    // Polygon rooms: draw white polygon fill instead of rectangle
+    oc2d.fillStyle = '#ffffff';
+    oc2d.beginPath();
+    t.polygonM.forEach(([xM, yM], i) => {
+      const px = (t.ox + xM * t.sc) * sx;
+      const py = (t.oy + yM * t.sc) * sy;
+      if (i === 0) oc2d.moveTo(px, py); else oc2d.lineTo(px, py);
+    });
+    oc2d.closePath();
+    oc2d.fill();
+  } else {
+    oc2d.fillStyle = '#ffffff';
+    oc2d.fillRect(
+      t.ox * sx, t.oy * sy,
+      t.surfW * sx, t.surfH * sy
+    );
+  }
 
   // Colored product zones
   S.placedProducts.forEach(pp => {
@@ -1811,6 +1992,10 @@ btnGenerate.addEventListener('click', async () => {
     height: S.selectedSurface.heightM,
     unit: 'm',
   };
+  // Include polygon vertices for non-rectangular rooms
+  if (S.selectedSurface.isPolygonRoom && S.selectedSurface.polygonM) {
+    roomDimensions.polygon = S.selectedSurface.polygonM;
+  }
 
   const openings = S.selectedSurface.type === 'floor'
     ? mapOpeningsToCompass()

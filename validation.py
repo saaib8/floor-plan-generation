@@ -83,6 +83,15 @@ def _build_validation_prompt(payload: dict) -> str:
     room_w = float(room.get("width") or 0)
     room_l = float(room.get("length") or 0)
 
+    # Detect polygon room
+    room_polygon = room.get("polygon")
+    is_polygon = (
+        room_polygon
+        and isinstance(room_polygon, list)
+        and len(room_polygon) >= 3
+    )
+    n_vertices = len(room_polygon) if is_polygon else 4
+
     product_specs = []
     for p in products:
         pid = p.get("id", "?")
@@ -108,12 +117,34 @@ def _build_validation_prompt(payload: dict) -> str:
 
     products_block = "\n".join(product_specs)
 
+    # Room description with polygon awareness
+    if is_polygon:
+        room_desc = (
+            f"Room: {room_w:.1f}m wide x {room_l:.1f}m deep bounding box "
+            f"(irregular polygon with {n_vertices} vertices — NOT rectangular)."
+        )
+        shape_check = (
+            "- Does the room shape match the POLYGON outline from the guide? "
+            "The room is NOT rectangular — verify it follows the polygon shape, not just proportions."
+        )
+        gap_note = (
+            "- For this polygon-shaped room, check that furniture positions relative to the "
+            "polygon walls match the guide, not just N/S/E/W gaps."
+        )
+    else:
+        room_desc = f"Room: {room_w:.1f}m wide x {room_l:.1f}m deep."
+        shape_check = "- Does the room shape match (walls, proportions)?"
+        gap_note = (
+            "- Are gaps between furniture and walls preserved? "
+            "If a product has a 2m gap to a wall in the guide, the render must show approximately the same gap."
+        )
+
     return f"""You are a strict spatial accuracy judge for interior design renders.
 
 IMAGE 1 is a 2D floor plan guide showing exact furniture positions as numbered gray rectangles.
 IMAGE 2 is a generated 3D isometric render that should match those positions.
 
-Room: {room_w:.1f}m wide x {room_l:.1f}m deep.
+{room_desc}
 
 Expected product positions (percentages from room edges):
 {products_block}
@@ -126,8 +157,8 @@ For each product, assess STRICTLY:
 Also check:
 - Are there any MISSING products (in guide but not in render)?
 - Are there any EXTRA products (in render but not in guide)? Count carefully — staging props from reference photos should NOT appear.
-- Does the room shape match (walls, proportions)?
-- Are gaps between furniture and walls preserved? If a product has a 2m gap to a wall in the guide, the render must show approximately the same gap.
+{shape_check}
+{gap_note}
 
 Respond with ONLY valid JSON in this exact format:
 {{
