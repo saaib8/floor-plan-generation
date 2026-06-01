@@ -38,8 +38,8 @@ const S = {
   openings: [],           // [{id, wallId, type, posAlongWall, widthM, sillHeight}]
   addingOpening: null,    // null | 'door' | 'window'
 
-  // Generation
-  isGenerating: false,
+  // Generation — per surface key ('floor', 'wall_<id>'): 'processing' | 'failed'
+  generatingSurfaces: {},
   isComposing: false,
   products: [],
   categories: [],
@@ -253,19 +253,12 @@ function drawCanvas1() {
     ctx1.lineWidth = isSelected ? 2.5 : 2;
     ctx1.stroke();
 
-    // Floor generated indicator: small dot at centroid
-    if (S.generatedImages['floor']) {
+    // Floor status dot at centroid (amber = generating, green = done)
+    const floorKey = 'floor';
+    if (S.generatingSurfaces[floorKey] === 'processing' || S.generatedImages[floorKey]) {
       const cx = S.drawPoints.reduce((s, p) => s + p.x, 0) / S.drawPoints.length;
       const cy = S.drawPoints.reduce((s, p) => s + p.y, 0) / S.drawPoints.length;
-      ctx1.save();
-      ctx1.beginPath();
-      ctx1.arc(cx, cy, 5, 0, Math.PI * 2);
-      ctx1.fillStyle = '#4a7c59';
-      ctx1.fill();
-      ctx1.strokeStyle = 'white';
-      ctx1.lineWidth = 1.5;
-      ctx1.stroke();
-      ctx1.restore();
+      drawSurfaceStatusDot(ctx1, cx, cy, 5, surfaceStatusColor(floorKey));
     }
   }
 
@@ -298,17 +291,9 @@ function drawCanvas1() {
     ctx1.fillText(`${w.lengthM.toFixed(2)}m`, 0, 0);
     ctx1.restore();
 
-    // Generated indicator: small green dot on the opposite side of the normal
-    if (S.generatedImages[`wall_${w.id}`]) {
-      ctx1.save();
-      ctx1.beginPath();
-      ctx1.arc(mx - nx * 18, my - ny * 18, 4.5, 0, Math.PI * 2);
-      ctx1.fillStyle = '#4a7c59';
-      ctx1.fill();
-      ctx1.strokeStyle = 'white';
-      ctx1.lineWidth = 1.5;
-      ctx1.stroke();
-      ctx1.restore();
+    const wallKey = `wall_${w.id}`;
+    if (S.generatingSurfaces[wallKey] === 'processing' || S.generatedImages[wallKey]) {
+      drawSurfaceStatusDot(ctx1, mx - nx * 18, my - ny * 18, 4.5, surfaceStatusColor(wallKey));
     }
   });
 
@@ -1390,6 +1375,59 @@ function currentSurfaceKey() {
   return S.selectedSurface.type === 'floor' ? 'floor' : `wall_${S.selectedSurface.wallId}`;
 }
 
+function surfaceKeyLabel(key) {
+  if (key === 'floor') return 'Floor';
+  const wallId = parseInt(String(key).replace('wall_', ''), 10);
+  const idx = S.walls.findIndex(w => w.id === wallId);
+  return idx >= 0 ? `Wall ${idx + 1}` : key;
+}
+
+function isSurfaceGenerating(surfaceKey) {
+  return !!(surfaceKey && S.generatingSurfaces[surfaceKey] === 'processing');
+}
+
+function activeGeneratingSurfaceKeys() {
+  return Object.keys(S.generatingSurfaces).filter(k => S.generatingSurfaces[k] === 'processing');
+}
+
+function surfaceStatusColor(surfaceKey) {
+  if (S.generatingSurfaces[surfaceKey] === 'processing') return '#d97706';
+  if (S.generatedImages[surfaceKey]) return '#4a7c59';
+  return '#9a9088';
+}
+
+function drawSurfaceStatusDot(ctx, x, y, radius, fillColor) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+  ctx.strokeStyle = 'white';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function setSurfaceGenerating(surfaceKey, state) {
+  if (!surfaceKey) return;
+  if (!state) {
+    delete S.generatingSurfaces[surfaceKey];
+  } else {
+    S.generatingSurfaces[surfaceKey] = state;
+  }
+  updateGenerateBtn();
+  updateComposeBtn();
+  drawCanvas1();
+  refreshGenerationStatus();
+}
+
+function refreshGenerationStatus() {
+  const active = activeGeneratingSurfaceKeys();
+  if (active.length === 0) return;
+  const labels = active.map(surfaceKeyLabel).join(', ');
+  setStatus(`Generating ${labels}…`, 'processing');
+}
+
 function saveSurfaceLayout() {
   const key = currentSurfaceKey();
   if (!key) return;
@@ -1413,10 +1451,23 @@ function restoreSurfaceLayout(key) {
 function updateGenerateBtn() {
   const hasProducts = S.placedProducts.length > 0;
   const allHaveUrls = S.placedProducts.every(pp => pp.imageUrl.trim());
-  btnGenerate.disabled = !hasProducts || !allHaveUrls || S.isGenerating;
+  const key = currentSurfaceKey();
+  const surfaceBusy = isSurfaceGenerating(key);
+  btnGenerate.disabled = !hasProducts || !allHaveUrls || surfaceBusy;
+  const labelSpan = btnGenerate.querySelector('span');
+  const labelText = surfaceBusy ? 'Generating…' : 'Generate';
+  if (labelSpan && labelSpan.nextSibling) {
+    labelSpan.nextSibling.textContent = labelText;
+  } else if (!labelSpan) {
+    btnGenerate.textContent = labelText;
+  } else {
+    btnGenerate.innerHTML = `<span>⚡</span> ${labelText}`;
+  }
   btnGenerate.title = hasProducts && !allHaveUrls
     ? 'Add a product photo URL for each placed product'
-    : '';
+    : surfaceBusy
+      ? 'This surface is already generating'
+      : 'Start generation for the selected surface (other surfaces can run in parallel)';
 }
 
 function updateComposeBtn() {
@@ -1432,18 +1483,22 @@ function updateComposeBtn() {
 function _updateGenTracker() {
   const tracker = document.getElementById('gen-tracker-info');
   if (!tracker) return;
-  const keys = Object.keys(S.generatedImages);
-  if (keys.length === 0) {
+  const doneKeys = Object.keys(S.generatedImages);
+  const inProgress = activeGeneratingSurfaceKeys();
+  if (doneKeys.length === 0 && inProgress.length === 0) {
     tracker.style.display = 'none';
     return;
   }
   tracker.style.display = '';
-  const wallCount = keys.filter(k => k.startsWith('wall_')).length;
+  const wallDone = doneKeys.filter(k => k.startsWith('wall_')).length;
   const totalWalls = S.walls.length;
   const floorDone = !!S.generatedImages['floor'];
   const parts = [];
+  if (inProgress.length) {
+    parts.push(`⏳ ${inProgress.map(surfaceKeyLabel).join(', ')}`);
+  }
   if (floorDone) parts.push('Floor ✓');
-  if (wallCount > 0) parts.push(`Walls ${wallCount}/${totalWalls}`);
+  if (wallDone > 0) parts.push(`Walls ${wallDone}/${totalWalls}`);
   tracker.textContent = parts.join(' · ');
 }
 
@@ -1476,6 +1531,7 @@ document.getElementById('tool-clear').addEventListener('click', () => {
   S.draggingOpening = null;
   S.colorIdx = 0;
   S.generatedImages = {};
+  S.generatingSurfaces = {};
   S.compositeImages = null;
   S.surfaceLayouts = {};
   S.isComposing = false;
@@ -2013,7 +2069,11 @@ function exportHighlightImage() {
 
 // ── Generate ───────────────────────────────────────────────────
 btnGenerate.addEventListener('click', async () => {
-  if (S.isGenerating || S.placedProducts.length === 0 || !S.selectedSurface) return;
+  const surfaceKey = currentSurfaceKey();
+  if (!surfaceKey || S.placedProducts.length === 0 || !S.selectedSurface) return;
+  if (isSurfaceGenerating(surfaceKey)) return;
+
+  saveSurfaceLayout();
 
   const highlightImg = exportHighlightImage();
   if (!highlightImg) { setStatus('Cannot export surface image', 'error'); return; }
@@ -2060,14 +2120,10 @@ btnGenerate.addEventListener('click', async () => {
     openings,
   };
 
-  // Capture the surface being generated NOW, so the async result is filed
-  // under the correct surface even if the user switches selection mid-generation.
-  const surfaceKey = currentSurfaceKey();
-
-  S.isGenerating = true;
-  btnGenerate.disabled = true;
-  setStatus('Starting generation…', 'processing');
-  resultSection.style.display = 'none';
+  setSurfaceGenerating(surfaceKey, 'processing');
+  if (currentSurfaceKey() === surfaceKey) {
+    resultSection.style.display = 'none';
+  }
 
   let genId;
   try {
@@ -2079,15 +2135,14 @@ btnGenerate.addEventListener('click', async () => {
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     genId = data.gen_id;
-    setStatus('Generating top view…', 'processing');
+    refreshGenerationStatus();
   } catch (err) {
-    setStatus(`Failed to start: ${err.message}`, 'error');
-    S.isGenerating = false;
-    updateGenerateBtn();
+    setSurfaceGenerating(surfaceKey, 'failed');
+    setStatus(`Failed to start ${surfaceKeyLabel(surfaceKey)}: ${err.message}`, 'error');
+    setTimeout(() => setSurfaceGenerating(surfaceKey, null), 3000);
     return;
   }
 
-  // Poll
   pollGeneration(genId, surfaceKey);
 });
 
@@ -2098,9 +2153,8 @@ async function pollGeneration(genId, surfaceKey) {
 
   const poll = async () => {
     if (Date.now() - start > MAX_WAIT) {
-      setStatus('Generation timed out', 'error');
-      S.isGenerating = false;
-      updateGenerateBtn();
+      setSurfaceGenerating(surfaceKey, null);
+      setStatus(`${surfaceKeyLabel(surfaceKey)} timed out`, 'error');
       return;
     }
 
@@ -2109,26 +2163,30 @@ async function pollGeneration(genId, surfaceKey) {
       const data = await res.json();
 
       if (data.status === 'success') {
-        setStatus('Generation complete!', 'success');
-        S.isGenerating = false;
-        updateGenerateBtn();
+        setSurfaceGenerating(surfaceKey, null);
         const images = data.result_images || { isometric: data.result_image };
-        // Store result under the surface that was active when generation STARTED,
-        // not whatever is selected now (the user may have switched mid-generation).
-        const key = surfaceKey || currentSurfaceKey();
-        if (key) {
-          S.generatedImages[key] = images;
-          drawCanvas1();
-          updateComposeBtn();
+        S.generatedImages[surfaceKey] = images;
+        updateComposeBtn();
+
+        const stillActive = activeGeneratingSurfaceKeys();
+        if (stillActive.length) {
+          refreshGenerationStatus();
+        } else {
+          setStatus(`${surfaceKeyLabel(surfaceKey)} complete!`, 'success');
         }
-        // Only swap the visible result if the user is still on that surface.
-        if (!key || currentSurfaceKey() === key) {
+
+        if (currentSurfaceKey() === surfaceKey) {
           showResult(images);
         }
       } else if (data.status === 'failed') {
-        setStatus(`Generation failed: ${data.reason || 'unknown error'}`, 'error');
-        S.isGenerating = false;
-        updateGenerateBtn();
+        setSurfaceGenerating(surfaceKey, 'failed');
+        const stillActive = activeGeneratingSurfaceKeys();
+        if (!stillActive.length) {
+          setStatus(`${surfaceKeyLabel(surfaceKey)} failed: ${data.reason || 'unknown error'}`, 'error');
+        } else {
+          refreshGenerationStatus();
+        }
+        setTimeout(() => setSurfaceGenerating(surfaceKey, null), 5000);
       } else {
         setTimeout(poll, INTERVAL);
       }
