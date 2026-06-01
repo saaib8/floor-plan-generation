@@ -1834,7 +1834,7 @@ btnGenerate.addEventListener('click', async () => {
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     genId = data.gen_id;
-    setStatus('Generating… this may take a minute', 'processing');
+    setStatus('Generating top view…', 'processing');
   } catch (err) {
     setStatus(`Failed to start: ${err.message}`, 'error');
     S.isGenerating = false;
@@ -1891,8 +1891,8 @@ async function pollGeneration(genId) {
   setTimeout(poll, INTERVAL);
 }
 
-const VIEW_LABELS = { isometric: 'Top View', front: 'Front View', corner: 'Corner View', elevation: 'Wall Elevation' };
-const VIEW_ORDER  = ['isometric', 'front', 'corner', 'elevation'];
+const VIEW_LABELS = { isometric: 'Top View', elevation: 'Wall Elevation' };
+const VIEW_ORDER  = ['isometric', 'elevation'];
 
 // Lightbox: clicking a result image opens it full-screen
 function openLightbox(src) {

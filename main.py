@@ -2,7 +2,6 @@ import asyncio
 import base64
 import logging
 import os
-import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -14,23 +13,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from db import get_categories as db_get_categories
+from db import get_product_two_d_icon, get_products as db_get_products
 from generation import generate_floor_plan, generate_product_placement, generate_room_composition
 from models import (
     ComposeRequest, FloorPlanRequest, GenerationRequest,
     GenerationStartResponse, GenerationStatusResponse,
 )
+from s3_client import s3
 
 BASE_DIR = Path(__file__).resolve().parent
-BACKEND_DIR = BASE_DIR.parents[1]
 
-# Reuse Mesaky backend environment for DB/S3, while letting this app's local
-# .env override OpenAI/Gemini/runtime values.
-load_dotenv(BACKEND_DIR / ".env")
-load_dotenv(BASE_DIR / ".env", override=True)
-
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "mesaky_backend.settings")
+load_dotenv(BASE_DIR / ".env")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -58,27 +52,7 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 # In-memory generation state  {gen_id: {...}}
 _generations: dict = {}
 _executor = ThreadPoolExecutor(max_workers=4)
-_django_initialized = False
 _s3_icon_key_cache: dict = {"expires_at": 0, "keys": set()}
-
-
-def _ensure_django():
-    """Initialize Django lazily so this app reuses Mesaky DB/settings."""
-    global _django_initialized
-    if _django_initialized:
-        return
-
-    import django
-
-    django.setup()
-    _django_initialized = True
-
-
-def _product_model():
-    _ensure_django()
-    from core.models import Product
-
-    return Product
 
 
 def _icon_bucket() -> str:
@@ -100,12 +74,9 @@ def _existing_s3_icon_keys() -> set[str]:
     if _s3_icon_key_cache["expires_at"] > now:
         return _s3_icon_key_cache["keys"]
 
-    _ensure_django()
-    from core.utils.s3_helper import s3
-
     bucket = _icon_bucket()
     keys: set[str] = set()
-    paginator = s3.get_paginator("list_objects_v2")
+    paginator = s3().get_paginator("list_objects_v2")
 
     for prefix in _icon_prefixes():
         page_iterator = paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/")
@@ -152,9 +123,9 @@ def _category_value(category: str | None) -> str:
     return (category or "").strip() or "uncategorized"
 
 
-def _product_to_payload(product) -> dict:
-    length_m = _to_meters(product.length, product.dimension_unit)
-    width_m = _to_meters(product.width, product.dimension_unit)
+def _row_to_payload(row: dict) -> dict:
+    length_m = _to_meters(row.get("length"), row.get("dimension_unit"))
+    width_m = _to_meters(row.get("width"), row.get("dimension_unit"))
     dimensions = None
     if length_m and width_m:
         # length = product's long dimension (along the wall, canvas X-axis)
@@ -164,17 +135,17 @@ def _product_to_payload(product) -> dict:
             "depth": width_m,
         }
 
-    product_id = product.id
+    product_id = row["id"]
     return {
         "id": product_id,
-        "name": product.name_english or f"Product {product_id}",
-        "category": _category_value(product.category),
-        "store_id": product.store_id,
-        "store_name": getattr(product.store, "name_english", "") or "",
+        "name": row.get("name_english") or f"Product {product_id}",
+        "category": _category_value(row.get("category")),
+        "store_id": row.get("store_id"),
+        "store_name": row.get("store_name") or "",
         "icon": f"/api/products/{product_id}/icon",
-        "two_d_icon": product.two_d_icon or "",
-        "image_url": product.image_url or "",
-        "dims": _format_dims(product.length, product.width, product.dimension_unit),
+        "two_d_icon": row.get("two_d_icon") or "",
+        "image_url": row.get("image_url") or "",
+        "dims": _format_dims(row.get("length"), row.get("width"), row.get("dimension_unit")),
         "dimensions": dimensions,
     }
 
@@ -192,35 +163,15 @@ def get_products(
     limit: int = Query(default=200, ge=1, le=500),
 ):
     try:
-        Product = _product_model()
         existing_icon_keys = _existing_s3_icon_keys()
-        if not existing_icon_keys:
-            return []
-
-        qs = (
-            Product.objects.filter(
-                is_active=True,
-                two_d_icon__isnull=False,
-                two_d_icon__in=existing_icon_keys,
-            )
-            .exclude(two_d_icon="")
-            .select_related("store")
-            .order_by("name_english")
+        rows = db_get_products(
+            allowed_keys=existing_icon_keys,
+            category=category,
+            search=search,
+            store_id=store_id,
+            limit=limit,
         )
-
-        if category:
-            if category == "uncategorized":
-                from django.db.models import Q
-
-                qs = qs.filter(Q(category__isnull=True) | Q(category=""))
-            else:
-                qs = qs.filter(category__iexact=category)
-        if search:
-            qs = qs.filter(name_english__icontains=search)
-        if store_id:
-            qs = qs.filter(store_id=store_id)
-
-        return [_product_to_payload(product) for product in qs[:limit]]
+        return [_row_to_payload(row) for row in rows]
     except Exception as exc:
         logger.error("Failed to load DB products: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to load DB products: {exc}")
@@ -229,31 +180,17 @@ def get_products(
 @app.get("/api/categories")
 def get_categories():
     try:
-        from django.db.models import Count
-
-        Product = _product_model()
         existing_icon_keys = _existing_s3_icon_keys()
-        if not existing_icon_keys:
-            return []
+        rows = db_get_categories(allowed_keys=existing_icon_keys)
 
-        rows = (
-            Product.objects.filter(
-                is_active=True,
-                two_d_icon__isnull=False,
-                two_d_icon__in=existing_icon_keys,
-            )
-            .exclude(two_d_icon="")
-            .values("category")
-            .annotate(count=Count("id"))
-        )
-        counts = {}
+        counts: dict[str, int] = {}
         for row in rows:
-            category = _category_value(row["category"])
-            counts[category] = counts.get(category, 0) + row["count"]
+            cat = _category_value(row.get("category"))
+            counts[cat] = counts.get(cat, 0) + int(row.get("count", 0))
 
         return [
-            {"category": category, "count": count}
-            for category, count in sorted(counts.items(), key=lambda item: item[0].lower())
+            {"category": cat, "count": count}
+            for cat, count in sorted(counts.items(), key=lambda item: item[0].lower())
         ]
     except Exception as exc:
         logger.error("Failed to load DB categories: %s", exc, exc_info=True)
@@ -262,29 +199,17 @@ def get_categories():
 
 @app.get("/api/products/{product_id}/icon")
 def get_product_icon(product_id: int):
-    Product = _product_model()
-    product = (
-        Product.objects.filter(
-            id=product_id,
-            two_d_icon__isnull=False,
-        )
-        .exclude(two_d_icon="")
-        .only("two_d_icon")
-        .first()
-    )
-    if not product:
+    key = get_product_two_d_icon(product_id)
+    if not key:
         raise HTTPException(status_code=404, detail="Product icon not found")
 
-    key = product.two_d_icon
     if key.startswith("http://") or key.startswith("https://"):
         return RedirectResponse(key)
     if key not in _existing_s3_icon_keys():
         raise HTTPException(status_code=404, detail="Product icon key does not exist in S3")
 
     try:
-        from core.utils.s3_helper import s3
-
-        obj = s3.get_object(Bucket=_icon_bucket(), Key=key)
+        obj = s3().get_object(Bucket=_icon_bucket(), Key=key)
         body = obj["Body"].read()
         content_type = obj.get("ContentType") or "image/svg+xml"
         if key.lower().endswith(".svg"):
@@ -311,7 +236,6 @@ async def start_generation(request: GenerationRequest):
 
     gen_id = str(uuid.uuid4())
 
-    # Decode and save the highlight image from base64
     try:
         raw_b64 = request.highlight_image.split(",")[-1]
         img_data = base64.b64decode(raw_b64)
@@ -384,7 +308,6 @@ def _save_view_results(gen_id: str, results: dict) -> dict:
 
 
 def _build_validation_metrics(attempt_metrics: list) -> dict:
-    """Build a validation_metrics dict from the attempt metrics list."""
     if not attempt_metrics:
         return {"enabled": False}
     final = attempt_metrics[-1]

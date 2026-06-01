@@ -33,7 +33,7 @@ class GenerationStatusResponse(BaseModel):
     gen_id: str
     status: str                          # "processing" | "success" | "failed"
     result_image: Optional[str] = None  # primary (isometric) image path
-    result_images: Optional[Dict[str, str]] = None  # all views: {isometric, front, corner}
+    result_images: Optional[Dict[str, str]] = None  # views: {isometric} or {elevation}
     reason: Optional[str] = None
     validation_metrics: Optional[Dict[str, Any]] = None  # spatial validation stats when enabled
 

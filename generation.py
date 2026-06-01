@@ -500,9 +500,6 @@ def _make_floor_plan_guide(payload: dict, canvas_size: int = 1024) -> bytes:
     return pil_to_png_bytes(img)
 
 
-_FLOOR_VIEWS = ["isometric", "front", "corner"]
-
-
 def _generate_isometric_with_validation(
     payload: dict,
     image_bytes_list: List[bytes],
@@ -596,15 +593,7 @@ def _generate_views_sequential(
     has_guide: bool = False,
     guide_bytes: Optional[bytes] = None,
 ) -> Tuple[Dict[str, bytes], List[Dict]]:
-    """
-    Two-step generation:
-      1. Generate isometric from JSON + product photos (with validation loop).
-      2. Generate front + corner in parallel using the isometric result as IMAGE 1,
-         so both derived views are anchored to the same committed layout.
-
-    Returns (view_images_dict, attempt_metrics_list).
-    """
-    # ── Step 1: isometric (with validation if enabled and guide available) ──
+    """Generate top-down (isometric) view only."""
     if guide_bytes is not None and VALIDATION_ENABLED:
         iso_bytes, attempt_metrics = _generate_isometric_with_validation(
             payload, image_bytes_list,
@@ -614,32 +603,14 @@ def _generate_views_sequential(
             has_guide=has_guide,
         )
     else:
-        # Fallback: no validation
         iso_prompt = build_floor_plan_prompt(
             payload, image_order=image_order, has_guide=has_guide, view="isometric"
         )
-        logger.info("Generating isometric view (no validation), prompt %d chars", len(iso_prompt))
+        logger.info("Generating top view (no validation), prompt %d chars", len(iso_prompt))
         iso_bytes = _openai_product_placement_edit(iso_prompt, image_bytes_list, size=size)
         attempt_metrics = []
 
-    # ── Step 2: front + corner derived from isometric ────────────────────────
-    # IMAGE 1 = isometric result; IMAGE 2+ = same product reference photos
-    derived_images = [iso_bytes] + image_bytes_list[1:]
-
-    def _gen_derived(view: str) -> tuple:
-        prompt = build_floor_plan_prompt(
-            payload, image_order=image_order, view=view, iso_base=True
-        )
-        logger.info("Generating %s view from isometric, prompt %d chars", view, len(prompt))
-        return view, _openai_product_placement_edit(prompt, derived_images, size=size)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {pool.submit(_gen_derived, v): v for v in ["front", "corner"]}
-        results = {"isometric": iso_bytes}
-        for future in as_completed(futures):
-            view_name, img_bytes = future.result()
-            results[view_name] = img_bytes
-    return results, attempt_metrics
+    return {"isometric": iso_bytes}, attempt_metrics
 
 
 def _generate_wall_elevation_with_validation(
@@ -727,8 +698,8 @@ def _generate_wall_elevation_with_validation(
 
 def generate_floor_plan(payload: dict, size: str = "1024x1024") -> Tuple[Dict[str, bytes], List[Dict]]:
     """
-    Generate isometric, front, and corner renders from a structured JSON payload.
-    Returns ({"isometric": bytes, "front": bytes, "corner": bytes}, attempt_metrics).
+    Generate top-down (isometric) render from a structured JSON payload.
+    Returns ({"isometric": bytes}, attempt_metrics).
     """
     _validate_and_clamp_layout(payload)
     products = payload.get("products", [])
@@ -1185,7 +1156,7 @@ def generate_product_placement(
     """Generate product placement renders for floor or wall surfaces.
 
     Returns (view_images_dict, attempt_metrics).
-    Floor: views = {"isometric", "front", "corner"}
+    Floor: views = {"isometric"}  (top view only)
     Wall:  views = {"elevation"}
     """
     if not products:
@@ -1205,7 +1176,7 @@ def generate_product_placement(
         cleaned["image_url"] = img_url
         cleaned_products.append(cleaned)
 
-    # ── Floor: programmatic guide + JSON geometry, 3 views ───────────────────
+    # ── Floor: programmatic guide + JSON geometry, top view only ───────────
     if generation_type == "floor":
         fp_payload, image_order = _batch_to_fp_payload(
             cleaned_products, room_dimensions or {}, presets or {},
