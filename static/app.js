@@ -4,7 +4,7 @@
 
 // ── Constants ─────────────────────────────────────────────────
 const SCALE = 60;          // pixels per metre on canvas 1
-const DEFAULT_WALL_H = 2.8;  // metres
+const DEFAULT_WALL_H = 4.0;  // metres
 const GRID_SIZE = SCALE;   // 1 grid square = 1m
 const SNAP_RADIUS = 12;    // px — snaps to existing points
 
@@ -2241,10 +2241,10 @@ async function pollGeneration(genId, surfaceKey) {
 
 const VIEW_LABELS = {
   isometric: 'Top View', elevation: 'Wall Elevation',
-  composition_sw: 'SW Corner', composition_ne: 'NE Corner',
+  composition_front: 'Room View', composition_back: 'Opposite View',
 };
 const VIEW_ORDER  = ['isometric', 'elevation'];
-const COMPOSITE_ORDER = ['composition_sw', 'composition_ne'];
+const COMPOSITE_ORDER = ['composition_front', 'composition_back'];
 
 // Lightbox: clicking a result image opens it full-screen
 function openLightbox(src) {
@@ -2666,23 +2666,43 @@ if (btnCompose) {
       const wallId = parseInt(key.slice(5));
       const wall = S.walls.find(w => w.id === wallId);
       const url = imgs.elevation || imgs.isometric || Object.values(imgs)[0];
-      if (url) {
+      if (url && wall) {
+        // The backend places each wall by compass direction, so it MUST receive
+        // a compass label ("north"/"south"/"east"/"west"), not a descriptive name.
         wallImageUrls.push({
           url,
           wall_id: wallId,
-          label: wall ? `${wall.lengthM.toFixed(1)}m wall` : `Wall ${wallId}`,
-          width_m: wall ? wall.lengthM : null,
+          label: wallToCompass(wall),
+          compass: wallToCompass(wall),
+          width_m: wall.lengthM,
           height_m: DEFAULT_WALL_H,
         });
       }
     }
     if (wallImageUrls.length === 0) { setStatus('Generate at least one wall first', 'error'); return; }
 
+    // Authoritative architectural openings per wall — ground truth so the backend knows
+    // exactly which walls are solid vs. have windows/doors (prevents hallucinated windows).
+    const composeOpenings = [];
+    S.openings.forEach(op => {
+      const wall = S.walls.find(w => w.id === op.wallId);
+      if (!wall) return;
+      composeOpenings.push({
+        compass: wallToCompass(wall),
+        type: op.type,
+        position_from_left: op.posAlongWall,  // fraction 0..1 along the wall
+        width_m: op.widthM,
+        sill_height: op.sillHeight,
+      });
+    });
+
     const xs = S.drawPoints.map(p => p.x);
     const ys = S.drawPoints.map(p => p.y);
+    const roomDepth = ys.length ? (Math.max(...ys) - Math.min(...ys)) / SCALE : 0;
     const roomDimensions = {
       width: xs.length ? (Math.max(...xs) - Math.min(...xs)) / SCALE : 0,
-      height: ys.length ? (Math.max(...ys) - Math.min(...ys)) / SCALE : 0,
+      depth: roomDepth,
+      height: roomDepth,  // kept for backward compatibility
       wall_height: DEFAULT_WALL_H,
       unit: 'm',
     };
@@ -2697,7 +2717,7 @@ if (btnCompose) {
       const res = await fetch('/api/compose', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ floor_image_url: floorUrl, wall_image_urls: wallImageUrls, room_dimensions: roomDimensions, presets: {} }),
+        body: JSON.stringify({ floor_image_url: floorUrl, wall_image_urls: wallImageUrls, room_dimensions: roomDimensions, presets: {}, openings: composeOpenings }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();

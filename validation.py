@@ -25,6 +25,19 @@ VALIDATION_SCORE_THRESHOLD = float(os.getenv("VALIDATION_SCORE_THRESHOLD", "0.75
 VALIDATION_CANDIDATES_PER_ATTEMPT = int(os.getenv("VALIDATION_CANDIDATES_PER_ATTEMPT", "1"))
 VALIDATION_TIMEOUT = int(os.getenv("VALIDATION_TIMEOUT", "60"))
 
+# ── Composition (dollhouse) validation — separate knobs so the user-facing
+#    composite can be held to a higher bar without inflating wall/floor cost.
+#    The QA loop does best-of-N SELECTION: each attempt generates
+#    COMPOSITION_CANDIDATES_PER_ATTEMPT fresh candidates in parallel and keeps the
+#    highest-scoring one, retrying up to COMPOSITION_MAX_ATTEMPTS times until one
+#    passes. (No whole-image refine edits — those diverged in practice.) ──
+COMPOSITION_VALIDATION_ENABLED = os.getenv(
+    "COMPOSITION_VALIDATION_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+COMPOSITION_MAX_ATTEMPTS = int(os.getenv("COMPOSITION_MAX_ATTEMPTS", "2"))
+COMPOSITION_CANDIDATES_PER_ATTEMPT = int(os.getenv("COMPOSITION_CANDIDATES_PER_ATTEMPT", "2"))
+COMPOSITION_SCORE_THRESHOLD = float(os.getenv("COMPOSITION_SCORE_THRESHOLD", "0.80"))
+
 
 # ── Data classes ─────────────────────────────────────────────────────────────
 
@@ -366,7 +379,7 @@ def _build_wall_validation_prompt(payload: dict) -> str:
     products = payload.get("products", [])
     wall = payload.get("wall", {})
     wall_w = float(wall.get("width") or 0)
-    wall_h = float(wall.get("height") or 2.8)
+    wall_h = float(wall.get("height") or 4.0)
     openings = payload.get("openings", [])
 
     product_specs = []
@@ -563,3 +576,275 @@ def validate_wall_accuracy(
     except Exception as exc:
         logger.warning("Wall validation failed (%s) — returning pass-through result", exc)
         return ValidationResult(score=0.5, passed=True, error=str(exc))
+
+
+# ── Composition (dollhouse) validation ───────────────────────────────────────
+#
+# The composite is the only image users see, so it gets its own image-to-image
+# check: the generated dollhouse view is compared against the SAME inputs it was
+# assembled from — the floor render and each visible wall's elevation. The model
+# verifies that every wall's content survived faithfully (same object TYPES, no
+# art↔window swaps), openings are preserved, nothing migrated between walls, and
+# the floor furniture is intact.
+
+def _describe_wall_openings_for_qa(compass: str, ops: Optional[List[Dict]]) -> str:
+    C = compass.upper()
+    if not ops:
+        return f"  - {C} wall: MUST have ZERO windows and ZERO doors (solid wall)."
+    counts: Dict[str, int] = {}
+    for o in ops:
+        t = (o.get("type") or "opening").lower()
+        counts[t] = counts.get(t, 0) + 1
+    spec = ", ".join(f"{n} {t}{'s' if n > 1 else ''}" for t, n in counts.items())
+    return f"  - {C} wall: MUST have exactly {spec} — no more, no fewer, none relocated."
+
+
+def _build_composition_validation_prompt(
+    designed_walls: List[str],
+    visible_walls: List[str],
+    openings_by_wall: Optional[Dict[str, List[Dict]]],
+    view: str,
+) -> str:
+    """Prompt for scoring a dollhouse composite against its source images + ground truth.
+
+    The image order sent to the model is:
+      IMAGE 1 = the GENERATED composite (to be judged)
+      IMAGE 2 = the floor render (furniture ground truth)
+      IMAGE 3.. = each DESIGNED wall elevation, in `designed_walls` order
+    `openings_by_wall` is the AUTHORITATIVE per-wall opening spec for ALL visible walls.
+    """
+    ob = openings_by_wall or {}
+
+    wall_lines = []
+    for i, compass in enumerate(designed_walls):
+        wall_lines.append(
+            f"  - IMAGE {i + 3} = the {compass.upper()} wall elevation. In the composite, the "
+            f"{compass.upper()} wall MUST show exactly these wall-mounted items (same TYPES — a "
+            f"framed picture/art stays a picture, never a window; never swapped), the same count, "
+            f"the same heights, and the SAME LEFT-TO-RIGHT ORDER as the elevation — NOT mirrored "
+            f"or flipped."
+        )
+    walls_block = "\n".join(wall_lines) if wall_lines else "  (No designed walls with elevations in this view.)"
+
+    openings_block = "\n".join(
+        _describe_wall_openings_for_qa(c, ob.get(c)) for c in visible_walls
+    ) or "  (No opening data provided.)"
+
+    wall_ids = ", ".join(w.upper() for w in visible_walls) or "(none)"
+
+    return f"""You are a strict QA inspector for an interior-design composite render.
+
+You are given several images:
+- IMAGE 1 = a generated open-box "dollhouse" render of a room (the {view.upper()} view) — THIS is what you judge.
+- IMAGE 2 = the floor render: the ground truth for floor furniture (identity, count, positions).
+{walls_block}
+
+## AUTHORITATIVE openings (the single source of truth — trust this over any image)
+For EACH visible wall, the composite must show exactly these openings and nothing else:
+{openings_block}
+
+Carefully COUNT the windows and doors on each wall in IMAGE 1 and compare to the list above.
+If a wall is marked "ZERO windows and ZERO doors" but IMAGE 1 shows ANY window or door on it,
+that is a FAILURE (set that wall's openings_correct=false and count each invented opening in
+extra_items). Invented windows on solid walls are the single most important defect to catch.
+
+Judge whether IMAGE 1 faithfully ASSEMBLES the sources. Check, per visible wall ({wall_ids}):
+1. CONTENT TYPE: every wall-mounted item from that wall's elevation appears on that SAME wall in
+   IMAGE 1, as the SAME type of object. A framed picture rendered as a window (or vice-versa) is a
+   FAILURE. A dropped/missing wall item is a FAILURE.
+2. POSITION/SIZE: each item is at roughly the right spot along the wall and the right relative size.
+3. OPENINGS: windows/doors EXACTLY match the authoritative list above — no extra, missing, or relocated.
+4. LEFT-RIGHT ORDER (MIRRORING): the items across the wall must appear in the SAME left-to-right
+   order as in that wall's elevation — NOT reversed. Use any door or window on the wall as an
+   anchor: if the elevation shows an item to the RIGHT of the door, it must STILL be to the right
+   of the door in IMAGE 1 (and likewise for left). If the wall's contents are mirrored / flipped
+   (order reversed, or an item that was on the right of an opening is now on its left), that wall
+   is a FAILURE — set its "left_right_correct" to false. This is a common, important defect.
+
+Also check globally:
+- MIGRATION: no item from one wall appears on a different wall, the floor, or the ceiling.
+- FLOOR: the furniture from IMAGE 2 is present, with the same count and roughly the same layout.
+- INVENTED/EXTRA: nothing was invented that is absent from all the sources / the authoritative list.
+
+Respond with ONLY valid JSON in this exact format:
+{{
+  "walls": [
+    {{"wall": "north", "content_matches": true, "openings_correct": true, "left_right_correct": true, "notes": "..."}}
+  ],
+  "migrated_items": 0,
+  "missing_items": 0,
+  "extra_items": 0,
+  "floor_furniture_correct": true,
+  "overall_notes": "brief summary of the most important problems, if any"
+}}"""
+
+
+def _parse_composition_validation_response(raw_text: str) -> ValidationResult:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Could not parse composition validation JSON — returning pass-through")
+        return ValidationResult(score=0.5, passed=True, error="Unparseable JSON response")
+
+    product_checks: List[ProductValidation] = []
+    walls_ok = True
+    openings_ok = True
+    mirrored_walls = 0
+    for w in data.get("walls", []):
+        content_ok = bool(w.get("content_matches", True))
+        opening_ok = bool(w.get("openings_correct", True))
+        lr_ok = bool(w.get("left_right_correct", True))
+        if not lr_ok:
+            mirrored_walls += 1
+        walls_ok = walls_ok and content_ok and lr_ok
+        openings_ok = openings_ok and opening_ok
+        product_checks.append(ProductValidation(
+            product_id=str(w.get("wall", "?")),
+            # A mirrored wall is a position failure (items are on the wrong side).
+            position_correct=content_ok and lr_ok,
+            size_correct=content_ok,
+            rotation_correct=lr_ok,
+            notes=w.get("notes", ""),
+        ))
+
+    migrated = int(data.get("migrated_items", 0))
+    missing = int(data.get("missing_items", 0))
+    extra = int(data.get("extra_items", 0))
+    floor_ok = bool(data.get("floor_furniture_correct", True))
+
+    # Score: migrations and missing items are the worst failures (they're exactly
+    # the dislocation/drop problems we are trying to eliminate). A mirrored/flipped
+    # wall is penalised heavily too, so best-of-N selection rejects flipped candidates.
+    score = 1.0
+    for pc in product_checks:
+        if not pc.size_correct:           # content/type mismatch
+            score -= 0.20
+    score -= mirrored_walls * 0.30
+    score -= migrated * 0.25
+    score -= missing * 0.20
+    score -= extra * 0.10
+    if not openings_ok:
+        score -= 0.15
+    if not floor_ok:
+        score -= 0.15
+    score = max(0.0, min(1.0, score))
+
+    return ValidationResult(
+        score=round(score, 3),
+        passed=score >= COMPOSITION_SCORE_THRESHOLD,
+        product_checks=product_checks,
+        missing_items=missing,
+        # fold migrations into extra_items so existing logging stays meaningful
+        extra_items=extra + migrated,
+        room_shape_correct=floor_ok,
+        openings_correct=openings_ok,
+    )
+
+
+def validate_composition_accuracy(
+    composite_bytes: bytes,
+    floor_bytes: bytes,
+    wall_items: List[Tuple[str, bytes]],
+    view: str,
+    visible_walls: Optional[List[str]] = None,
+    openings_by_wall: Optional[Dict[str, List[Dict]]] = None,
+) -> ValidationResult:
+    """Compare a dollhouse composite against the floor render + each wall elevation,
+    using the authoritative per-wall openings as ground truth.
+
+    wall_items:       (compass, elevation_bytes) for DESIGNED walls in this view (have images).
+    visible_walls:    ALL walls visible in this view (designed or not) — for opening checks.
+    openings_by_wall: authoritative {compass: [opening,...]} ground truth.
+    On any failure returns score=0.5/passed=True so composition is never blocked.
+    """
+    try:
+        designed_walls = [c for c, _ in wall_items]
+        all_visible = visible_walls or designed_walls
+        prompt = _build_composition_validation_prompt(
+            designed_walls, all_visible, openings_by_wall, view
+        )
+
+        content: List[dict] = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": _image_to_data_url(composite_bytes), "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": _image_to_data_url(floor_bytes), "detail": "high"}},
+        ]
+        for _compass, elev_bytes in wall_items:
+            content.append(
+                {"type": "image_url", "image_url": {"url": _image_to_data_url(elev_bytes), "detail": "high"}}
+            )
+
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {_openai_api_key()}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": VALIDATION_MODEL,
+                "messages": [{"role": "user", "content": content}],
+                "temperature": 0.1,
+                "max_tokens": 1500,
+            },
+            timeout=VALIDATION_TIMEOUT,
+        )
+
+        if not response.ok:
+            logger.warning(
+                "Composition validation API error %s: %s — returning pass-through result",
+                response.status_code, response.text[:500],
+            )
+            return ValidationResult(score=0.5, passed=True, error=f"API error {response.status_code}")
+
+        raw_text = response.json()["choices"][0]["message"]["content"]
+        return _parse_composition_validation_response(raw_text)
+
+    except Exception as exc:
+        logger.warning("Composition validation failed (%s) — returning pass-through result", exc)
+        return ValidationResult(score=0.5, passed=True, error=str(exc))
+
+
+def build_composition_correction_notes(validation: ValidationResult) -> str:
+    """Turn composition validation failures into corrective text for a retry.
+
+    Returns a per-wall + global instruction block to append to the add-wall prompts.
+    """
+    if validation.passed:
+        return ""
+
+    lines = ["## CORRECTIONS FROM THE PREVIOUS ATTEMPT (fix these exactly)"]
+
+    for pc in validation.product_checks:
+        if not pc.position_correct:
+            detail = f" — {pc.notes}" if pc.notes else ""
+            lines.append(
+                f"- The {pc.product_id.upper()} wall did not match its elevation.{detail} "
+                f"Reproduce that wall's items with the correct object TYPE, count, position, and size."
+            )
+
+    if validation.missing_items > 0:
+        lines.append(
+            f"- {validation.missing_items} item(s) from the source images are MISSING. "
+            f"Every wall item and every piece of floor furniture must appear."
+        )
+    if validation.extra_items > 0:
+        lines.append(
+            f"- {validation.extra_items} item(s) were INVENTED or MIGRATED to the wrong wall. "
+            f"Remove anything not present in that wall's own elevation; keep each item on its own wall."
+        )
+    if not validation.openings_correct:
+        lines.append(
+            "- Door/window openings are wrong (extra, missing, or relocated). "
+            "Keep exactly the openings shown for each wall — do not add or move any."
+        )
+    if not validation.room_shape_correct:
+        lines.append(
+            "- The floor furniture changed. Keep all furniture exactly as in the floor render."
+        )
+
+    return "\n".join(lines)
