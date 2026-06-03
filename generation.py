@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -11,14 +11,24 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-from prompt import build_floor_plan_prompt, build_wall_plan_prompt, build_composition_prompt
+from prompt import (
+    build_floor_plan_prompt, build_wall_plan_prompt,
+    build_dollhouse_shell_prompt, build_dollhouse_add_wall_prompt,
+    build_geometric_furnish_prompt, build_dollhouse_oneshot_prompt,
+    dollhouse_view_walls,
+)
+import geometry as geo_mod
 from validation import (
     VALIDATION_ENABLED,
     VALIDATION_MAX_ATTEMPTS,
     VALIDATION_CANDIDATES_PER_ATTEMPT,
+    COMPOSITION_VALIDATION_ENABLED,
+    COMPOSITION_MAX_ATTEMPTS,
+    COMPOSITION_CANDIDATES_PER_ATTEMPT,
     ValidationResult,
     validate_spatial_accuracy,
     validate_wall_accuracy,
+    validate_composition_accuracy,
     build_correction_notes,
     pick_best_candidate,
 )
@@ -26,7 +36,7 @@ from validation import (
 logger = logging.getLogger(__name__)
 
 MODEL = "gpt-image-2"
-_DEFAULT_WALL_H = 2.8  # metres
+_DEFAULT_WALL_H = 4.0  # metres
 
 
 # ── URL / path utilities ────────────────────────────────────────────────────
@@ -185,6 +195,103 @@ def _openai_product_placement_edit(
     return base64.b64decode(payload["data"][0]["b64_json"])
 
 
+# ── Gemini API (composition / Nano Banana) ──────────────────────────────────
+# The composite is the only image the user sees, so it runs on Gemini's image model
+# (gemini-3-pro-image by default). Nano Banana fuses multiple reference images in a
+# single call while preserving each subject's identity, and edits surgically without
+# re-drawing the rest — which is exactly what robust compositing + self-correction need.
+
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3-pro-image")
+# Backends for the two opposite dollhouse views:
+#   oneshot   – (DEFAULT) one call per view: floor + all four wall elevations sent together with
+#               an explicit Image→compass map in the prompt; the model removes the near wall and
+#               renders the cutaway in a single pass. Fewest model calls (lowest latency).
+#   geometric – guide-anchored: a computed structure guide locks the camera/walls, the model
+#               furnishes the floor, then paints each wall one elevation at a time.
+#   gemini    – fully generative shell-from-floor + per-wall edits.
+#   openai    – the gemini pipeline on gpt-image-2.
+COMPOSITION_BACKEND = os.getenv("COMPOSITION_BACKEND", "oneshot").strip().lower()
+COMPOSITION_ASPECT_RATIO = os.getenv("COMPOSITION_ASPECT_RATIO", "4:3")
+COMPOSITION_IMAGE_SIZE = os.getenv("COMPOSITION_IMAGE_SIZE", "2K")
+
+
+def _gemini_api_key() -> str:
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not key:
+        raise RuntimeError("Set GEMINI_API_KEY in environment.")
+    return key
+
+
+def _extract_gemini_image(payload: Dict) -> bytes:
+    for cand in (payload.get("candidates") or []):
+        for part in ((cand.get("content") or {}).get("parts") or []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                return base64.b64decode(inline["data"])
+    cands = payload.get("candidates") or []
+    finish = cands[0].get("finishReason") if cands else None
+    raise RuntimeError(
+        f"Gemini returned no image (finishReason={finish}): {str(payload)[:1000]}"
+    )
+
+
+def _gemini_image_edit(
+    prompt: str,
+    image_bytes_list: List[bytes],
+    model: Optional[str] = None,
+    aspect_ratio: Optional[str] = None,
+    image_size: Optional[str] = None,
+) -> bytes:
+    """Generate/edit an image with a Gemini image model via the REST API.
+
+    Accepts multiple reference images in one call (floor + each wall elevation, or a
+    prior composite for refinement). Returns raw image bytes.
+    """
+    model = model or GEMINI_IMAGE_MODEL
+    aspect_ratio = aspect_ratio or COMPOSITION_ASPECT_RATIO
+    image_size = image_size or COMPOSITION_IMAGE_SIZE
+
+    parts: List[Dict] = [{"text": prompt}]
+    for image_bytes in image_bytes_list:
+        parts.append({
+            "inline_data": {
+                "mime_type": _guess_mime(image_bytes),
+                "data": base64.b64encode(image_bytes).decode("ascii"),
+            }
+        })
+
+    body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"],
+            "imageConfig": {"aspectRatio": aspect_ratio, "imageSize": image_size},
+        },
+    }
+
+    logger.info(
+        "Gemini image call: model=%s prompt_len=%d images=%d aspect=%s size=%s",
+        model, len(prompt), len(image_bytes_list), aspect_ratio, image_size,
+    )
+    response = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={"x-goog-api-key": _gemini_api_key(), "Content-Type": "application/json"},
+        json=body,
+        timeout=300,
+    )
+    if not response.ok:
+        error_body = response.text[:2000]
+        logger.error("Gemini API error %s: %s", response.status_code, error_body)
+        raise RuntimeError(f"Gemini API error {response.status_code}: {error_body}")
+    return _sanitize_image_bytes(_extract_gemini_image(response.json()))
+
+
+def _compose_edit(prompt: str, image_bytes_list: List[bytes]) -> bytes:
+    """Route a composition image edit to the configured backend (gemini | openai)."""
+    if COMPOSITION_BACKEND == "openai":
+        return _openai_product_placement_edit(prompt, image_bytes_list)
+    return _gemini_image_edit(prompt, image_bytes_list)
+
+
 # ── Floor plan generation (text → image, no base image required) ─────────────
 
 def _openai_generate(prompt: str, size: str = "1024x1024") -> bytes:
@@ -218,6 +325,16 @@ def _make_blank_canvas(size: str = "1024x1024") -> bytes:
     w, h = (int(x) for x in size.split("x"))
     img = Image.new("RGB", (w, h), "white")
     return pil_to_png_bytes(img)
+
+
+def _make_plain_wall(wall_color: str = "#F3EFE8", size: Tuple[int, int] = (1024, 768)) -> bytes:
+    """A solid wall-colour elevation, used as a placeholder for a wall that has no design so the
+    fixed [floor, N, S, E, W] image order stays intact in the single-shot composition call."""
+    try:
+        rgb = hex_to_rgb(wall_color)
+    except Exception:
+        rgb = (243, 239, 232)
+    return pil_to_png_bytes(Image.new("RGB", size, rgb))
 
 
 # ── Floor plan guide generation ─────────────────────────────────────────────
@@ -826,7 +943,7 @@ def _batch_to_fp_payload(
     room_dict = {
         "width": w,
         "length": h,
-        "height": 2.8,
+        "height": _DEFAULT_WALL_H,
         "flooring": {"type": flooring_type, "material": flooring_material},
         "walls": {"color": wall_color},
     }
@@ -1303,17 +1420,28 @@ def generate_room_composition(
     wall_image_urls: List[Dict],
     room_dimensions: Optional[Dict] = None,
     presets: Optional[Dict] = None,
+    openings: Optional[List[Dict]] = None,
     base_dir: Optional[str] = None,
 ) -> Dict[str, bytes]:
-    """Generate isometric compositions from two opposite corners.
+    """Generate TWO opposite open-box (dollhouse) isometric room renders.
 
-    Returns {"sw": bytes, "ne": bytes}:
-      sw — camera at SW corner looking NE; shows NORTH + EAST walls.
-      ne — camera at NE corner looking SW; shows SOUTH + WEST walls.
+    - "front": near SOUTH wall removed; shows NORTH (back) + WEST (left) + EAST (right).
+    - "back":  180°-opposite view, near NORTH wall removed; shows SOUTH (back) +
+               EAST (left) + WEST (right) — so the wall missing from "front" is visible.
+    Together the two views reveal all four walls. Each wall's products are rendered only
+    on that wall (never moved between walls).
+
+    Returns {"front": bytes, "back": bytes}.
 
     floor_image_url: server-relative path like "/outputs/xxx_isometric.png"
-    wall_image_urls: list of {url, label, width_m, height_m} — label must be a compass
-                     direction ("north", "south", "east", "west").
+    wall_image_urls: list of {url, compass|label, wall_id, width_m, height_m}. Each wall
+                     is placed by compass direction ("north"/"south"/"east"/"west"),
+                     read from "compass" (preferred) or "label".
+    openings:        AUTHORITATIVE per-wall architectural openings (ground truth):
+                     [{compass, type, position_from_left(0..1), width_m, sill_height}].
+                     Used to (a) tell the shell exactly which walls are blank vs. have
+                     windows/doors (stops hallucinated windows) and (b) give the QA
+                     validator a real reference so it can catch invented openings.
     """
     root = Path(base_dir) if base_dir else Path(__file__).parent
 
@@ -1327,41 +1455,214 @@ def generate_room_composition(
 
     floor_bytes = _resolve(floor_image_url)
 
-    # Build compass → bytes mapping from the provided wall elevation images
+    # Build compass → bytes mapping from the provided wall elevation images.
+    # Prefer the explicit "compass" field; fall back to "label" for compatibility.
+    _VALID_COMPASS = {"north", "south", "east", "west"}
     wall_map: Dict[str, bytes] = {}
     for wi in wall_image_urls:
-        label = (wi.get("label") or "").lower().strip()
-        if label:
-            wall_map[label] = _resolve(wi["url"])
+        compass = (wi.get("compass") or wi.get("label") or "").lower().strip()
+        if compass not in _VALID_COMPASS:
+            logger.warning(
+                "Composition: skipping wall id=%s with non-compass label %r "
+                "(expected north/south/east/west)",
+                wi.get("wall_id"), compass,
+            )
+            continue
+        wall_map[compass] = _resolve(wi["url"])
 
-    # Each corner view sees exactly 2 walls; order defines IMAGE 2, IMAGE 3
-    _CORNER_WALLS = {
-        "sw": ["north", "east"],
-        "ne": ["south", "west"],
-    }
+    # Group authoritative openings by compass so each wall knows exactly what it has.
+    openings_by_wall: Dict[str, List[Dict]] = {}
+    for op in (openings or []):
+        compass = (op.get("compass") or op.get("label") or "").lower().strip()
+        if compass in _VALID_COMPASS:
+            openings_by_wall.setdefault(compass, []).append(op)
+    logger.info(
+        "Composition openings ground truth: %s",
+        {k: len(v) for k, v in openings_by_wall.items()} or "none",
+    )
 
-    def _gen_corner(corner: str) -> tuple:
-        ordered = _CORNER_WALLS[corner]
-        corner_labels = [w for w in ordered if w in wall_map]
-        images = [floor_bytes] + [wall_map[w] for w in corner_labels]
-        prompt = build_composition_prompt(
-            room_dimensions=room_dimensions or {},
-            wall_labels=corner_labels,
-            presets=presets or {},
-            n_walls=len(corner_labels),
-            corner=corner,
+    def _assemble_once(view: str, visible_designed: List[str], correction_notes: str) -> bytes:
+        # Sequential pipeline (avoids multi-image confusion / hallucination):
+        #   1. Build an EMPTY dollhouse shell from the floor (locks camera + furniture +
+        #      architectural openings). BOTH views build their shell from the floor render, so
+        #      the furniture is always present in each — the opposite corners come from the
+        #      shell prompt's camera, not from rotating one composite into the other.
+        #   2. Add each designed wall's content ONE wall at a time — the model only ever sees a
+        #      single wall elevation per call, so it cannot swap walls, leak a product onto the
+        #      wrong wall, or invent content. Runs on the configured backend (Gemini edits are
+        #      surgical, so each step changes only the targeted wall).
+        shell_prompt = build_dollhouse_shell_prompt(
+            view, room_dimensions=room_dimensions or {}, presets=presets or {},
+            openings_by_wall=openings_by_wall,
         )
+        logger.info("Composition %s: building empty dollhouse shell from floor", view)
+        current = _compose_edit(shell_prompt, [floor_bytes])
+
+        for compass in visible_designed:
+            add_prompt = build_dollhouse_add_wall_prompt(
+                view, compass,
+                room_dimensions=room_dimensions or {},
+                presets=presets or {},
+                correction_notes=correction_notes,
+            )
+            logger.info("Composition %s: adding %s wall content", view, compass)
+            current = _compose_edit(add_prompt, [current, wall_map[compass]])
+        return current
+
+    def _assemble_geometric(view: str, visible_designed: List[str], correction_notes: str) -> bytes:
+        # GUIDE-ANCHORED backend. The room's structure (camera, the exact two walls, floor diamond,
+        # and openings) is COMPUTED and rendered as a flat geometry guide. The model only ever
+        # renders ONTO that locked structure, so it cannot invent an extra wall, mirror an
+        # elevation, or render the two views from the same angle — but, unlike the old homography
+        # warp, every pixel is photorealistically rendered (no stickered/flat walls, no seam
+        # speckle, no floor-strip bleed). Pipeline:
+        #   1. Compute the open-box geometry for this view and render a flat GEOMETRY GUIDE
+        #      (correct camera + the two far walls + floor diamond + opening rectangles).
+        #   2. AI furnishes the guide's floor from the floor render — the guide locks the camera
+        #      and wall planes, so this is limited to placing furniture; walls stay bare.
+        #   3. Add each wall's content ONE wall at a time: the model sees the furnished render plus
+        #      a single flat elevation and paints that elevation's decor onto the matching (already
+        #      visible) wall plane, foreshortened and lit to match. Single-elevation-per-call +
+        #      the guide-locked left/right wall planes prevent any wall swap or product leak.
+        guide_w, guide_h = 1024, 768  # 4:3, matches COMPOSITION_ASPECT_RATIO
+        geo = geo_mod.compute_dollhouse_geometry(
+            room_dimensions or {}, view, guide_w, guide_h,
+            openings_by_wall=openings_by_wall,
+        )
+        guide_img = geo_mod.render_guide(
+            geo, guide_w, guide_h,
+            wall_color=(presets or {}).get("wall_color", "#F3EFE8"),
+        )
+        furnish_prompt = build_geometric_furnish_prompt(
+            view, room_dimensions=room_dimensions or {}, presets=presets or {},
+            openings_by_wall=openings_by_wall,
+        )
+        logger.info("Composition %s (geometric): furnishing computed guide from floor", view)
+        current = _compose_edit(furnish_prompt, [pil_to_png_bytes(guide_img), floor_bytes])
+
+        # Paint each wall's decor onto its (guide-locked) plane, one elevation at a time.
+        for compass in visible_designed:
+            add_prompt = build_dollhouse_add_wall_prompt(
+                view, compass,
+                room_dimensions=room_dimensions or {},
+                presets=presets or {},
+                correction_notes=correction_notes,
+            )
+            logger.info("Composition %s (geometric): adding %s wall content onto locked plane", view, compass)
+            current = _compose_edit(add_prompt, [current, wall_map[compass]])
+        return current
+
+    def _run_qa_loop(view: str, assemble_fn, visible_order: List[str]) -> bytes:
+        # Validated best-of-N SELECTION. The composite is the only image the user sees, so it
+        # gets a GPT-4o vision QA gate (vs. the floor render, each wall elevation, and the
+        # authoritative openings). We generate independent candidates (in parallel) and KEEP THE
+        # HIGHEST-SCORING one. We deliberately do NOT run whole-image "refine" edits: in practice
+        # those diverged (degraded the composite, e.g. 0.65 → 0.05) instead of converging, so
+        # selecting the best of several fresh samples beats trying to correct a bad one.
+        visible_designed = [c for c in visible_order if c in wall_map]
+        wall_items = [(c, wall_map[c]) for c in visible_designed]
+
+        if not visible_designed or not COMPOSITION_VALIDATION_ENABLED:
+            best = assemble_fn("")
+            logger.info("Composition %s view done (no QA): walls=%s", view, visible_designed)
+            return best
+
+        max_attempts = max(1, COMPOSITION_MAX_ATTEMPTS)
+        candidates_per = max(1, COMPOSITION_CANDIDATES_PER_ATTEMPT)
+        best_bytes: Optional[bytes] = None
+        best_vr: Optional[ValidationResult] = None
+
+        def _validate(cand: bytes) -> ValidationResult:
+            return validate_composition_accuracy(
+                cand, floor_bytes, wall_items, view,
+                visible_walls=list(visible_order),
+                openings_by_wall=openings_by_wall,
+            )
+
+        def _make_candidate() -> Tuple[bytes, ValidationResult]:
+            cand = assemble_fn("")
+            return cand, _validate(cand)
+
+        for attempt in range(1, max_attempts + 1):
+            # Each attempt is a fresh batch of independent best-of-N candidates (parallel).
+            if candidates_per > 1:
+                with ThreadPoolExecutor(max_workers=min(candidates_per, 4)) as pool:
+                    cand_scored: List[Tuple[bytes, ValidationResult]] = list(
+                        pool.map(lambda _: _make_candidate(), range(candidates_per))
+                    )
+            else:
+                cand_scored = [_make_candidate()]
+
+            for _cand_bytes, vr in cand_scored:
+                logger.info(
+                    "Composition %s attempt %d/%d: score=%.3f passed=%s missing=%d extra/migrated=%d",
+                    view, attempt, max_attempts, vr.score, vr.passed,
+                    vr.missing_items, vr.extra_items,
+                )
+
+            attempt_bytes, attempt_vr = pick_best_candidate(cand_scored)
+            if best_vr is None or attempt_vr.score > best_vr.score:
+                best_bytes, best_vr = attempt_bytes, attempt_vr
+
+            if best_vr.passed:
+                break
+
         logger.info(
-            "Composition %s corner: walls=%s prompt=%d chars images=%d",
-            corner, corner_labels, len(prompt), len(images),
+            "Composition %s view done: walls=%s best_score=%.3f",
+            view, visible_designed, best_vr.score if best_vr else -1.0,
         )
-        return corner, _openai_product_placement_edit(prompt, images)
+        return best_bytes
 
+    def _ordered_wall_images() -> List[bytes]:
+        # Fixed [NORTH, SOUTH, EAST, WEST] order so the Image→compass mapping in the single-shot
+        # prompt always holds. A wall with no elevation gets a plain wall-colour placeholder.
+        wall_color = (presets or {}).get("wall_color", "#F3EFE8")
+        placeholder: Optional[bytes] = None
+        out: List[bytes] = []
+        for c in ("north", "south", "east", "west"):
+            b = wall_map.get(c)
+            if b is None:
+                if placeholder is None:
+                    placeholder = _make_plain_wall(wall_color)
+                logger.info("Composition oneshot: %s wall has no elevation, using plain placeholder", c)
+                b = placeholder
+            out.append(b)
+        return out
+
+    def _assemble_oneshot(removed_wall: str) -> bytes:
+        # Single call: floor (IMAGE 1) + the four wall elevations (IMAGE 2..5 = N, S, E, W) sent
+        # together, with the verbatim prompt that maps each image to its compass wall and removes
+        # the near wall. No shell/warp/per-wall edits — the model renders the cutaway in one pass.
+        prompt = build_dollhouse_oneshot_prompt(removed_wall)
+        images = [floor_bytes] + _ordered_wall_images()
+        logger.info("Composition oneshot: remove %s wall, single call with %d images", removed_wall, len(images))
+        return _compose_edit(prompt, images)
+
+    # ── Compose the two opposite cutaway views. A GPT-4o vision QA gate keeps the best of several
+    # fresh candidates (best-of-N selection). ──
+    if COMPOSITION_BACKEND == "oneshot":
+        logger.info("Composition backend: ONESHOT (floor + four walls in a single call per view)")
+        # "front" removes the SOUTH wall (camera outside south, North is the focal back wall);
+        # "back" removes the NORTH wall (camera outside north). Together they reveal all walls.
+        front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_oneshot("south"), ["north", "east", "west"])
+        back_fn = lambda: _run_qa_loop("back", lambda n: _assemble_oneshot("north"), ["south", "east", "west"])
+    elif COMPOSITION_BACKEND == "geometric":
+        logger.info("Composition backend: GEOMETRIC (computed structure guide + guided photoreal fill)")
+        front_designed = [c for c in dollhouse_view_walls("front")[1] if c in wall_map]
+        back_designed = [c for c in dollhouse_view_walls("back")[1] if c in wall_map]
+        front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_geometric("front", front_designed, n), dollhouse_view_walls("front")[1])
+        back_fn = lambda: _run_qa_loop("back", lambda n: _assemble_geometric("back", back_designed, n), dollhouse_view_walls("back")[1])
+    else:
+        front_designed = [c for c in dollhouse_view_walls("front")[1] if c in wall_map]
+        back_designed = [c for c in dollhouse_view_walls("back")[1] if c in wall_map]
+        front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_once("front", front_designed, n), dollhouse_view_walls("front")[1])
+        back_fn = lambda: _run_qa_loop("back", lambda n: _assemble_once("back", back_designed, n), dollhouse_view_walls("back")[1])
+
+    # The two views are fully independent — run them concurrently so total wall-clock is one
+    # view's latency, not two. (Each view internally also parallelises its best-of-N candidates.)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(_gen_corner, c) for c in ("sw", "ne")]
-        results: Dict[str, bytes] = {}
-        for f in as_completed(futures):
-            corner_name, img_bytes = f.result()
-            results[corner_name] = img_bytes
-
-    return results
+        fut_front = pool.submit(front_fn)
+        fut_back = pool.submit(back_fn)
+        front_bytes = fut_front.result()
+        back_bytes = fut_back.result()
+    return {"front": front_bytes, "back": back_bytes}

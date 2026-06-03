@@ -42,6 +42,7 @@ class WallImageUrl(BaseModel):
     url: str                           # server-relative path, e.g. "/outputs/xxx_elevation.png"
     wall_id: Optional[int] = None
     label: Optional[str] = None
+    compass: Optional[str] = None      # "north"/"south"/"east"/"west" — used for placement
     width_m: Optional[float] = None
     height_m: Optional[float] = None
 
@@ -51,6 +52,9 @@ class ComposeRequest(BaseModel):
     wall_image_urls: List[WallImageUrl]
     room_dimensions: Optional[Dict[str, Any]] = None
     presets: Optional[Dict[str, Any]] = None
+    # Authoritative architectural openings per wall (ground truth for which walls have
+    # windows/doors). Each item: {compass, type, position_from_left(0..1), width_m, sill_height}.
+    openings: Optional[List[Dict[str, Any]]] = []
 
 
 class FloorPlanRequest(BaseModel):

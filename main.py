@@ -8,24 +8,28 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
 
-from db import get_categories as db_get_categories
-from db import get_product_two_d_icon, get_products as db_get_products
-from placement_categories import normalize_surface
-from generation import generate_floor_plan, generate_product_placement, generate_room_composition
-from models import (
+# Load .env BEFORE importing the local modules below: several of them read env vars at IMPORT
+# time into module-level constants (e.g. COMPOSITION_BACKEND, COMPOSITION_VALIDATION_ENABLED in
+# generation/validation). If .env is loaded after those imports, the constants silently fall back
+# to their defaults and .env overrides are ignored.
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+from fastapi import FastAPI, HTTPException, Query, Response  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import FileResponse, RedirectResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+from db import get_categories as db_get_categories  # noqa: E402
+from db import get_product_two_d_icon, get_products as db_get_products  # noqa: E402
+from placement_categories import normalize_surface  # noqa: E402
+from generation import generate_floor_plan, generate_product_placement, generate_room_composition  # noqa: E402
+from models import (  # noqa: E402
     ComposeRequest, FloorPlanRequest, GenerationRequest,
     GenerationStartResponse, GenerationStatusResponse,
 )
-from s3_client import s3
-
-BASE_DIR = Path(__file__).resolve().parent
-
-load_dotenv(BASE_DIR / ".env")
+from s3_client import s3  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -398,6 +402,7 @@ def _run_composition(gen_id: str, payload: dict):
             wall_image_urls=[dict(wi) for wi in payload["wall_image_urls"]],
             room_dimensions=payload.get("room_dimensions"),
             presets=payload.get("presets"),
+            openings=payload.get("openings") or [],
             base_dir=str(BASE_DIR),
         )
         paths: dict = {}
@@ -407,7 +412,7 @@ def _run_composition(gen_id: str, payload: dict):
             paths[f"composition_{corner_name}"] = f"/outputs/{gen_id}_composition_{corner_name}.png"
 
         # SW corner is the primary (standard hero view)
-        primary = paths.get("composition_sw") or next(iter(paths.values()))
+        primary = paths.get("composition_front") or next(iter(paths.values()))
         _generations[gen_id]["status"] = "success"
         _generations[gen_id]["result_image"] = primary
         _generations[gen_id]["result_images"] = paths
