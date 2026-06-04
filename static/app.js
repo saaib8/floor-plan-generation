@@ -15,6 +15,56 @@ const PRODUCT_COLORS = [
   '#D62828','#F77F00','#023E8A','#2D6A4F','#9B2226',
 ];
 
+// Alrugaib catalog rows use length/width opposite to other stores; swap only on canvas.
+const ALRUGAIB_STORE_IDS = new Set([56, 80]);
+
+function isAlrugaibStore(product) {
+  if (!product) return false;
+  const storeId = product.store_id != null ? Number(product.store_id) : null;
+  if (storeId != null && ALRUGAIB_STORE_IDS.has(storeId)) return true;
+  const name = (product.store_name || '').trim().toLowerCase();
+  return name === 'alrugaib';
+}
+
+/** Footprint metres for canvas bounding box (may swap W/D for Alrugaib). */
+function canvasFootprintMetres(product, isWallSurface) {
+  const dims = product.dimensions || {};
+  let wM = parseFloat(dims.width) || 1;
+  let dM = isWallSurface
+    ? (parseFloat(dims.height) || parseFloat(dims.depth) || wM)
+    : (parseFloat(dims.depth) || parseFloat(dims.height) || wM);
+  if (isAlrugaibStore(product)) [wM, dM] = [dM, wM];
+  return { wM, dM };
+}
+
+function footprintToCanvasPx(wM, dM, rotation, t) {
+  const rotPortrait = (rotation || 0) % 180 !== 0;
+  const effW = rotPortrait ? dM : wM;
+  const effH = rotPortrait ? wM : dM;
+  let rawW = effW * t.sc;
+  let rawH = effH * t.sc;
+  const maxPx = Math.min(t.surfW, t.surfH) * 0.9;
+  const overflowScale = Math.min(1, maxPx / Math.max(rawW, rawH));
+  return {
+    wPx: Math.max(24, rawW * overflowScale),
+    hPx: Math.max(24, rawH * overflowScale),
+  };
+}
+
+/** Re-apply swapped Alrugaib footprint (fixes stale placements / cached sessions). */
+function syncAlrugaibPlacedSize(pp, t) {
+  if (!isAlrugaibStore(pp.product)) return;
+  const isWallSurface = S.selectedSurface && S.selectedSurface.type === 'wall';
+  const { wM, dM } = canvasFootprintMetres(pp.product, isWallSurface);
+  const { wPx, hPx } = footprintToCanvasPx(wM, dM, pp.rotation, t);
+  const cxMid = pp.cx + pp.wPx / 2;
+  const cyMid = pp.cy + pp.hPx / 2;
+  pp.wPx = wPx;
+  pp.hPx = hPx;
+  pp.cx = Math.max(t.ox, Math.min(t.ox + t.surfW - wPx, cxMid - wPx / 2));
+  pp.cy = Math.max(t.oy, Math.min(t.oy + t.surfH - hPx, cyMid - hPx / 2));
+}
+
 // ── State ──────────────────────────────────────────────────────
 const S = {
   // Drawing
@@ -708,6 +758,8 @@ function renderSurface() {
   const isPolygonRoom = S.selectedSurface.isPolygonRoom || false;
   c2._transform = { ox, oy, sc, surfW, surfH, widthM, heightM, polygonM, isPolygonRoom };
 
+  S.placedProducts.forEach(pp => syncAlrugaibPlacedSize(pp, c2._transform));
+
   // Surface background
   if (S.selectedSurface.type === 'wall') {
     ctx2.fillStyle = '#f5f2ee';
@@ -934,7 +986,6 @@ function renderSurface() {
       const imgW = (pp.rotation % 180 === 0) ? pp.wPx : pp.hPx;
       const imgH = (pp.rotation % 180 === 0) ? pp.hPx : pp.wPx;
       if (pp.img.complete && pp.img.naturalWidth) {
-        // Stretch icon to fill the bounding box with a small uniform padding.
         const pad = Math.max(2, Math.min(imgW, imgH) * 0.04);
         ctx2.drawImage(pp.img, -imgW / 2 + pad, -imgH / 2 + pad, imgW - pad * 2, imgH - pad * 2);
       } else {
@@ -947,13 +998,9 @@ function renderSurface() {
       ctx2.restore();
     }
 
-    // Dimension label: "W × D cm" below the bounding box
-    const dims = pp.product.dimensions || {};
+    // Dimension label: "W × D cm" below the bounding box (matches canvas footprint)
     const isWall = S.selectedSurface && S.selectedSurface.type === 'wall';
-    const dimA = parseFloat(dims.width) || 0;
-    const dimB = isWall
-      ? (parseFloat(dims.height) || parseFloat(dims.depth) || 0)
-      : (parseFloat(dims.depth)  || parseFloat(dims.height) || 0);
+    const { wM: dimA, dM: dimB } = canvasFootprintMetres(pp.product, isWall);
     if (dimA && dimB) {
       // Convert metres → cm for display
       const aCm = Math.round(dimA * 100);
@@ -1224,22 +1271,9 @@ function placeProduct(product, dropX, dropY) {
   // Box size = physical dimensions scaled to canvas.
   // Wall surface: height axis = product standing height.
   // Floor surface: height axis = product depth (footprint).
-  const dims = product.dimensions || {};
   const isWallSurface = S.selectedSurface && S.selectedSurface.type === 'wall';
-  const wM = parseFloat(dims.width)  || 1;
-  const dM = isWallSurface
-    ? (parseFloat(dims.height) || parseFloat(dims.depth) || wM)
-    : (parseFloat(dims.depth)  || parseFloat(dims.height) || wM);
-
-  let rawW = wM * t.sc;
-  let rawH = dM * t.sc;
-
-  // Proportional clamp: if either side would exceed 90% of the surface,
-  // scale BOTH sides down together so the aspect ratio is preserved.
-  const maxPx = Math.min(t.surfW, t.surfH) * 0.9;
-  const overflowScale = Math.min(1, maxPx / Math.max(rawW, rawH));
-  let wPx = Math.max(24, rawW * overflowScale);
-  let hPx = Math.max(24, rawH * overflowScale);
+  const { wM, dM } = canvasFootprintMetres(product, isWallSurface);
+  const { wPx, hPx } = footprintToCanvasPx(wM, dM, 0, t);
 
   // Center drop point, clamped inside surface bounding box
   let cx = Math.max(t.ox, Math.min(t.ox + t.surfW - wPx, dropX - wPx / 2));
