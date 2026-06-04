@@ -198,7 +198,7 @@ def compute_dollhouse_geometry(
         if quads:
             openings_out[compass] = quads
 
-    return {"view": view, "floor": floor, "walls": walls, "openings": openings_out}
+    return {"view": view, "floor": floor, "walls": walls, "openings": openings_out, "project": project}
 
 
 def _hex_to_rgb(hex_color: str, default=(243, 239, 232)) -> Tuple[int, int, int]:

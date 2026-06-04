@@ -14,10 +14,12 @@ from PIL import Image, ImageDraw, ImageFont
 from prompt import (
     build_floor_plan_prompt, build_wall_plan_prompt,
     build_dollhouse_shell_prompt, build_dollhouse_add_wall_prompt,
-    build_geometric_furnish_prompt, build_dollhouse_oneshot_prompt,
+    build_geometric_furnish_prompt, build_geometric_composite_prompt,
+    build_dollhouse_oneshot_prompt,
     dollhouse_view_walls,
 )
 import geometry as geo_mod
+from models import RoomScene, CameraViewData
 from validation import (
     VALIDATION_ENABLED,
     VALIDATION_MAX_ATTEMPTS,
@@ -25,10 +27,12 @@ from validation import (
     COMPOSITION_VALIDATION_ENABLED,
     COMPOSITION_MAX_ATTEMPTS,
     COMPOSITION_CANDIDATES_PER_ATTEMPT,
+    CROSS_VIEW_VALIDATION_ENABLED,
     ValidationResult,
     validate_spatial_accuracy,
     validate_wall_accuracy,
     validate_composition_accuracy,
+    validate_cross_view_consistency,
     build_correction_notes,
     pick_best_candidate,
 )
@@ -327,6 +331,17 @@ def _make_blank_canvas(size: str = "1024x1024") -> bytes:
     return pil_to_png_bytes(img)
 
 
+def _rotate_floor_for_back(image_bytes: bytes) -> bytes:
+    """Rotate a floor plan 180 so its layout aligns with the back-view camera.
+
+    The back view looks from outside the NORTH wall toward SOUTH. Rotating 180
+    puts SOUTH at the top (far/back wall) and NORTH at the bottom (near/removed),
+    matching the natural top=far, bottom=near orientation the front view has."""
+    img = Image.open(BytesIO(image_bytes))
+    rotated = img.rotate(180)
+    return pil_to_png_bytes(rotated)
+
+
 def _make_plain_wall(wall_color: str = "#F3EFE8", size: Tuple[int, int] = (1024, 768)) -> bytes:
     """A solid wall-colour elevation, used as a placeholder for a wall that has no design so the
     fixed [floor, N, S, E, W] image order stays intact in the single-shot composition call."""
@@ -335,6 +350,96 @@ def _make_plain_wall(wall_color: str = "#F3EFE8", size: Tuple[int, int] = (1024,
     except Exception:
         rgb = (243, 239, 232)
     return pil_to_png_bytes(Image.new("RGB", size, rgb))
+
+
+# ── Furniture footprint drawing for deterministic composite ──────────────────
+
+_FOOTPRINT_COLORS = [
+    (180, 90, 90),   # muted red
+    (90, 90, 180),   # muted blue
+    (90, 160, 90),   # muted green
+    (180, 150, 70),  # muted gold
+    (150, 90, 180),  # muted purple
+    (90, 160, 160),  # muted teal
+    (180, 120, 90),  # muted orange
+    (120, 120, 90),  # muted olive
+]
+
+
+def _draw_furniture_on_guide(
+    guide_img: Image.Image,
+    geo: Dict,
+    floor_products: Optional[List[Dict]],
+) -> Image.Image:
+    """Draw solid furniture footprints at exact isometric positions on the guide image.
+
+    Each product becomes a colored polygon on the floor diamond, labeled with its
+    index (F1, F2, ...) and short name. The AI can see exactly WHERE each piece
+    belongs without any spatial reasoning — positions are LOCKED by the drawing.
+    """
+    if not floor_products or "project" not in geo:
+        return guide_img
+
+    project = geo["project"]
+    img = guide_img.copy().convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    label_font = _get_font(14)
+    name_font = _get_font(10)
+
+    for idx, fp in enumerate(floor_products):
+        cx = float(fp.get("x_m") or 0)
+        cy = float(fp.get("y_m") or 0)
+        dims = fp.get("dimensions") or {}
+        w = float(dims.get("width") or 0)
+        d = float(dims.get("depth") or w)
+        rot = int(fp.get("rotation") or 0) % 360
+        name = fp.get("product_name", "item")
+
+        if not w or not d:
+            continue
+
+        # Effective footprint after rotation (90/270 swaps w/d)
+        eff_w, eff_d = (d, w) if rot in (90, 270) else (w, d)
+        hw, hd = eff_w / 2, eff_d / 2
+
+        # 4 corners on the floor (z=0) in room coordinates → projected to screen
+        corners = [
+            project(cx - hw, cy - hd, 0),
+            project(cx + hw, cy - hd, 0),
+            project(cx + hw, cy + hd, 0),
+            project(cx - hw, cy + hd, 0),
+        ]
+
+        base_color = _FOOTPRINT_COLORS[idx % len(_FOOTPRINT_COLORS)]
+        fill_color = base_color + (160,)  # semi-transparent
+        outline_rgb = tuple(min(255, c + 60) for c in base_color)
+
+        draw.polygon(corners, fill=fill_color, outline=outline_rgb, width=2)
+
+        # Label centered on the polygon
+        center = project(cx, cy, 0)
+        label = f"F{idx + 1}"
+        bbox = draw.textbbox((0, 0), label, font=label_font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        # White text with dark outline for readability
+        lx, ly = center[0] - tw / 2, center[1] - th / 2 - 6
+        for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            draw.text((lx + dx, ly + dy), label, fill=(0, 0, 0, 220), font=label_font)
+        draw.text((lx, ly), label, fill=(255, 255, 255, 255), font=label_font)
+
+        # Short name below the label
+        short = name[:12] + ("…" if len(name) > 12 else "")
+        nbbox = draw.textbbox((0, 0), short, font=name_font)
+        ntw = nbbox[2] - nbbox[0]
+        nx, ny = center[0] - ntw / 2, center[1] - th / 2 + 8
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            draw.text((nx + dx, ny + dy), short, fill=(0, 0, 0, 200), font=name_font)
+        draw.text((nx, ny), short, fill=(255, 255, 255, 240), font=name_font)
+
+    result = Image.alpha_composite(img, overlay).convert("RGB")
+    logger.info("Drew %d furniture footprints on guide", len(floor_products))
+    return result
 
 
 # ── Floor plan guide generation ─────────────────────────────────────────────
@@ -1422,6 +1527,7 @@ def generate_room_composition(
     presets: Optional[Dict] = None,
     openings: Optional[List[Dict]] = None,
     base_dir: Optional[str] = None,
+    floor_products: Optional[List[Dict]] = None,
 ) -> Dict[str, bytes]:
     """Generate TWO opposite open-box (dollhouse) isometric room renders.
 
@@ -1481,6 +1587,26 @@ def generate_room_composition(
         {k: len(v) for k, v in openings_by_wall.items()} or "none",
     )
 
+    # ── Build the canonical Scene Graph ──────────────────────────────────────
+    # Single source of truth: both views derive their transforms from this.
+    rd = room_dimensions or {}
+    scene = RoomScene(
+        room_width_m=float(rd.get("width") or 0),
+        room_depth_m=float(rd.get("depth") or rd.get("height") or rd.get("length") or 0),
+        wall_height_m=float(rd.get("wall_height") or rd.get("height") or 0) or 4.0,
+        floor_image=floor_bytes,
+        walls=dict(wall_map),
+        openings=dict(openings_by_wall),
+        floor_products=list(floor_products or []),
+        wall_color=(presets or {}).get("wall_color", "#F3EFE8"),
+    )
+    logger.info(
+        "Scene graph: %.1f×%.1f×%.1fm, %d walls, %d floor products, %d opening groups",
+        scene.room_width_m, scene.room_depth_m, scene.wall_height_m,
+        len(scene.walls), len(scene.floor_products),
+        sum(len(v) for v in scene.openings.values()),
+    )
+
     def _assemble_once(view: str, visible_designed: List[str], correction_notes: str) -> bytes:
         # Sequential pipeline (avoids multi-image confusion / hallucination):
         #   1. Build an EMPTY dollhouse shell from the floor (locks camera + furniture +
@@ -1494,9 +1620,11 @@ def generate_room_composition(
         shell_prompt = build_dollhouse_shell_prompt(
             view, room_dimensions=room_dimensions or {}, presets=presets or {},
             openings_by_wall=openings_by_wall,
+            floor_products=floor_products,
         )
+        fp = _rotate_floor_for_back(floor_bytes) if view == "back" else floor_bytes
         logger.info("Composition %s: building empty dollhouse shell from floor", view)
-        current = _compose_edit(shell_prompt, [floor_bytes])
+        current = _compose_edit(shell_prompt, [fp])
 
         for compass in visible_designed:
             add_prompt = build_dollhouse_add_wall_prompt(
@@ -1509,7 +1637,7 @@ def generate_room_composition(
             current = _compose_edit(add_prompt, [current, wall_map[compass]])
         return current
 
-    def _assemble_geometric(view: str, visible_designed: List[str], correction_notes: str) -> bytes:
+    def _assemble_geometric(view: str, visible_designed: List[str], correction_notes: str, style_ref: Optional[bytes] = None) -> bytes:
         # GUIDE-ANCHORED backend. The room's structure (camera, the exact two walls, floor diamond,
         # and openings) is COMPUTED and rendered as a flat geometry guide. The model only ever
         # renders ONTO that locked structure, so it cannot invent an extra wall, mirror an
@@ -1520,6 +1648,8 @@ def generate_room_composition(
         #      (correct camera + the two far walls + floor diamond + opening rectangles).
         #   2. AI furnishes the guide's floor from the floor render — the guide locks the camera
         #      and wall planes, so this is limited to placing furniture; walls stay bare.
+        #      If a style_ref (the front view) is provided, it is sent as IMAGE 3 so the model
+        #      matches its rendering style, lighting, and object appearances.
         #   3. Add each wall's content ONE wall at a time: the model sees the furnished render plus
         #      a single flat elevation and paints that elevation's decor onto the matching (already
         #      visible) wall plane, foreshortened and lit to match. Single-elevation-per-call +
@@ -1536,9 +1666,16 @@ def generate_room_composition(
         furnish_prompt = build_geometric_furnish_prompt(
             view, room_dimensions=room_dimensions or {}, presets=presets or {},
             openings_by_wall=openings_by_wall,
+            floor_products=floor_products,
+            has_style_ref=style_ref is not None,
         )
-        logger.info("Composition %s (geometric): furnishing computed guide from floor", view)
-        current = _compose_edit(furnish_prompt, [pil_to_png_bytes(guide_img), floor_bytes])
+        fp = _rotate_floor_for_back(floor_bytes) if view == "back" else floor_bytes
+        images = [pil_to_png_bytes(guide_img), fp]
+        if style_ref:
+            images.append(style_ref)
+        logger.info("Composition %s (geometric): furnishing guide from floor%s", view,
+                     " + front-view style reference" if style_ref else "")
+        current = _compose_edit(furnish_prompt, images)
 
         # Paint each wall's decor onto its (guide-locked) plane, one elevation at a time.
         for compass in visible_designed:
@@ -1551,6 +1688,122 @@ def generate_room_composition(
             logger.info("Composition %s (geometric): adding %s wall content onto locked plane", view, compass)
             current = _compose_edit(add_prompt, [current, wall_map[compass]])
         return current
+
+    def _assemble_deterministic_back(visible_designed: List[str], correction_notes: str, style_ref: Optional[bytes] = None) -> bytes:
+        """DETERMINISTIC COMPOSITE backend for the back view.
+
+        Instead of asking the AI to build the room from scratch (which consistently fails
+        for the back/opposite view), we compute as much as possible deterministically:
+
+        1. Compute the geometry guide (locks camera + room structure — DETERMINISTIC)
+        2. Draw furniture footprints at exact isometric positions on the guide (DETERMINISTIC)
+        3. Warp wall elevations onto their quads via homography (DETERMINISTIC)
+        4. Send the pre-composited result + floor plan + front view to AI
+        5. AI only needs to: make it photorealistic + replace colored polygons with furniture
+
+        This eliminates hallucination of room structure, wall content, and furniture positions.
+        The AI's job is reduced to texture/material/shadow rendering — not spatial reasoning.
+        """
+        guide_w, guide_h = 1024, 768  # 4:3, matches COMPOSITION_ASPECT_RATIO
+        geo = geo_mod.compute_dollhouse_geometry(
+            room_dimensions or {}, "back", guide_w, guide_h,
+            openings_by_wall=openings_by_wall,
+        )
+
+        # Step 1: Render base guide (flat walls + floor + openings)
+        guide_img = geo_mod.render_guide(
+            geo, guide_w, guide_h,
+            wall_color=(presets or {}).get("wall_color", "#F3EFE8"),
+        )
+
+        # Step 2: Draw furniture footprints at exact isometric positions
+        guide_with_furniture = _draw_furniture_on_guide(guide_img, geo, floor_products)
+
+        # Step 3: Warp wall elevations onto their quads (DETERMINISTIC — no AI)
+        elevations = {c: wall_map[c] for c in visible_designed if c in wall_map}
+        if elevations:
+            composited = geo_mod.composite_walls(guide_with_furniture, geo, elevations)
+            logger.info(
+                "Composition back (deterministic): warped %s wall elevation(s) onto quads",
+                list(elevations.keys()),
+            )
+        else:
+            composited = guide_with_furniture
+
+        # Step 4: ONE AI pass — photorealism + replace colored polygons with furniture
+        prompt = build_geometric_composite_prompt(
+            "back",
+            room_dimensions=room_dimensions or {},
+            presets=presets or {},
+            floor_products=floor_products,
+            has_style_ref=style_ref is not None,
+        )
+        fp = _rotate_floor_for_back(floor_bytes)
+        images = [pil_to_png_bytes(composited), fp]
+        if style_ref:
+            images.append(style_ref)
+
+        logger.info(
+            "Composition back (deterministic): AI polish pass — wall warps + %d furniture footprints + floor plan%s",
+            len(floor_products or []),
+            " + front-view style ref" if style_ref else "",
+        )
+        return _compose_edit(prompt, images)
+
+    def _assemble_flipped_back(correction_notes: str = "") -> bytes:
+        """FLIPPED FRONT VIEW backend for the back view.
+
+        Uses the Scene Graph's camera_view() to derive all transforms from the
+        canonical room data. The back view is reframed as a standard front view
+        of a "rotated room":
+
+        1. Scene graph computes: wall swaps, coordinate transforms, opening remaps
+        2. Floor plan rotated 180°
+        3. SAME proven _ONESHOT_REMOVE_SOUTH prompt template
+
+        The model renders what it thinks is a standard front-view cutaway, but the
+        visual content is from the opposite walls — producing an accurate back view
+        using the model's strong front-view training priors.
+        """
+        # Derive all transforms from the canonical scene graph.
+        cv = scene.camera_view(removed_wall="north")
+
+        # Validate scene graph has room dimensions (critical for coordinate transforms).
+        if scene.room_width_m <= 0 or scene.room_depth_m <= 0:
+            logger.warning(
+                "Scene graph: room dimensions missing (%.1f×%.1f) — "
+                "coordinate transforms will be approximate. Pass room_dimensions "
+                "to ComposeRequest for accurate back-view furniture placement.",
+                scene.room_width_m, scene.room_depth_m,
+            )
+
+        # Build the floor image.
+        rotated_fp = _rotate_floor_for_back(floor_bytes) if cv.rotate_floor else floor_bytes
+
+        # Build wall image list in prompt slot order [N, S, E, W].
+        blank = _make_plain_wall(scene.wall_color)
+        swapped_images = [
+            cv.wall_images.get("north") or blank,   # Image 2: "North" = actually South
+            blank,                                    # Image 3: "South" = REMOVED
+            cv.wall_images.get("east") or blank,     # Image 4: "East"  = actually West
+            cv.wall_images.get("west") or blank,     # Image 5: "West"  = actually East
+        ]
+
+        # Build prompt using the PROVEN front-view template.
+        prompt = build_dollhouse_oneshot_prompt(
+            cv.prompt_removed_wall,  # "south" — standard front-view prompt
+            floor_products=cv.floor_products or None,
+            openings_by_wall=cv.openings_by_wall or None,
+            room_dimensions=room_dimensions,
+        )
+
+        images = [rotated_fp] + swapped_images
+        logger.info(
+            "Composition back (scene-graph → flipped-front): "
+            "swapped walls [S→N, blank→S, W→E, E→W], %d images, %d floor products",
+            len(images), len(cv.floor_products),
+        )
+        return _compose_edit(prompt, images)
 
     def _run_qa_loop(view: str, assemble_fn, visible_order: List[str]) -> bytes:
         # Validated best-of-N SELECTION. The composite is the only image the user sees, so it
@@ -1613,13 +1866,21 @@ def generate_room_composition(
         )
         return best_bytes
 
-    def _ordered_wall_images() -> List[bytes]:
+    def _ordered_wall_images(removed_wall: Optional[str] = None) -> List[bytes]:
         # Fixed [NORTH, SOUTH, EAST, WEST] order so the Image→compass mapping in the single-shot
         # prompt always holds. A wall with no elevation gets a plain wall-colour placeholder.
+        # The REMOVED wall is always blanked to prevent its visual content (windows, art) from
+        # leaking onto other walls — the model sees a solid colour and has nothing to misplace.
         wall_color = (presets or {}).get("wall_color", "#F3EFE8")
         placeholder: Optional[bytes] = None
         out: List[bytes] = []
         for c in ("north", "south", "east", "west"):
+            if c == (removed_wall or "").lower():
+                if placeholder is None:
+                    placeholder = _make_plain_wall(wall_color)
+                logger.info("Composition oneshot: blanking removed %s wall to prevent content leakage", c)
+                out.append(placeholder)
+                continue
             b = wall_map.get(c)
             if b is None:
                 if placeholder is None:
@@ -1633,36 +1894,84 @@ def generate_room_composition(
         # Single call: floor (IMAGE 1) + the four wall elevations (IMAGE 2..5 = N, S, E, W) sent
         # together, with the verbatim prompt that maps each image to its compass wall and removes
         # the near wall. No shell/warp/per-wall edits — the model renders the cutaway in one pass.
-        prompt = build_dollhouse_oneshot_prompt(removed_wall)
-        images = [floor_bytes] + _ordered_wall_images()
+        # For the back view (remove north), rotate the floor plan 180° so its spatial layout
+        # aligns with the camera direction — top=far(south), bottom=near(north removed).
+        prompt = build_dollhouse_oneshot_prompt(
+            removed_wall, floor_products=floor_products,
+            openings_by_wall=openings_by_wall,
+            room_dimensions=room_dimensions,
+        )
+        fp = _rotate_floor_for_back(floor_bytes) if removed_wall.lower() == "north" else floor_bytes
+        images = [fp] + _ordered_wall_images(removed_wall=removed_wall)
         logger.info("Composition oneshot: remove %s wall, single call with %d images", removed_wall, len(images))
         return _compose_edit(prompt, images)
 
-    # ── Compose the two opposite cutaway views. A GPT-4o vision QA gate keeps the best of several
-    # fresh candidates (best-of-N selection). ──
+    # ── Compose the two opposite cutaway views. ──
+    #
+    # FRONT VIEW: uses the configured backend (oneshot by default). The model has strong
+    # training priors for the standard front-view dollhouse cutaway and produces accurate results.
+    #
+    # BACK VIEW: uses the FLIPPED FRONT VIEW approach. Instead of asking the model to
+    # render from the opposite angle (which it consistently fails at), we reframe the back
+    # view as a standard front view of a "rotated room":
+    #   - Rotate floor plan 180°
+    #   - Swap wall images: South→"North", West→"East", East→"West"
+    #   - Use the SAME proven _ONESHOT_REMOVE_SOUTH prompt
+    # The model leverages its strong front-view training priors for BOTH views.
+
     if COMPOSITION_BACKEND == "oneshot":
-        logger.info("Composition backend: ONESHOT (floor + four walls in a single call per view)")
-        # "front" removes the SOUTH wall (camera outside south, North is the focal back wall);
-        # "back" removes the NORTH wall (camera outside north). Together they reveal all walls.
+        logger.info("Composition backend: ONESHOT front + FLIPPED-FRONT back")
         front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_oneshot("south"), ["north", "east", "west"])
-        back_fn = lambda: _run_qa_loop("back", lambda n: _assemble_oneshot("north"), ["south", "east", "west"])
     elif COMPOSITION_BACKEND == "geometric":
-        logger.info("Composition backend: GEOMETRIC (computed structure guide + guided photoreal fill)")
+        logger.info("Composition backend: GEOMETRIC front + FLIPPED-FRONT back")
         front_designed = [c for c in dollhouse_view_walls("front")[1] if c in wall_map]
-        back_designed = [c for c in dollhouse_view_walls("back")[1] if c in wall_map]
         front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_geometric("front", front_designed, n), dollhouse_view_walls("front")[1])
-        back_fn = lambda: _run_qa_loop("back", lambda n: _assemble_geometric("back", back_designed, n), dollhouse_view_walls("back")[1])
     else:
         front_designed = [c for c in dollhouse_view_walls("front")[1] if c in wall_map]
-        back_designed = [c for c in dollhouse_view_walls("back")[1] if c in wall_map]
         front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_once("front", front_designed, n), dollhouse_view_walls("front")[1])
-        back_fn = lambda: _run_qa_loop("back", lambda n: _assemble_once("back", back_designed, n), dollhouse_view_walls("back")[1])
 
-    # The two views are fully independent — run them concurrently so total wall-clock is one
-    # view's latency, not two. (Each view internally also parallelises its best-of-N candidates.)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_front = pool.submit(front_fn)
-        fut_back = pool.submit(back_fn)
-        front_bytes = fut_front.result()
-        back_bytes = fut_back.result()
+    front_bytes = front_fn()
+
+    # Back view: FLIPPED FRONT VIEW — reframed as a standard front view with swapped walls.
+    # All transforms (wall swaps, coordinate flips, opening remaps) are derived from the
+    # scene graph, ensuring both views share the same canonical room data.
+    back_fn = lambda: _run_qa_loop(
+        "back",
+        lambda n: _assemble_flipped_back(n),
+        dollhouse_view_walls("back")[1],
+    )
+    back_bytes = back_fn()
+
+    # ── Cross-view consistency check ─────────────────────────────────────
+    # Verify that front and back views depict the SAME room: matching
+    # furniture counts, shared wall content, no hallucinated objects.
+    # If the check fails, retry the back view once (front is typically good).
+    if CROSS_VIEW_VALIDATION_ENABLED:
+        cross_vr = validate_cross_view_consistency(
+            front_bytes=front_bytes,
+            back_bytes=back_bytes,
+            floor_bytes=floor_bytes,
+            expected_furniture_count=len(scene.floor_products),
+            shared_walls=["east", "west"],
+        )
+        if not cross_vr.passed:
+            logger.warning(
+                "Cross-view check FAILED (score=%.3f): retrying back view. Issues: %s",
+                cross_vr.score,
+                "; ".join(pc.notes for pc in cross_vr.product_checks if pc.notes),
+            )
+            back_bytes = back_fn()
+            # Re-validate (log only, don't block).
+            cross_vr2 = validate_cross_view_consistency(
+                front_bytes=front_bytes,
+                back_bytes=back_bytes,
+                floor_bytes=floor_bytes,
+                expected_furniture_count=len(scene.floor_products),
+                shared_walls=["east", "west"],
+            )
+            logger.info(
+                "Cross-view retry result: score=%.3f passed=%s",
+                cross_vr2.score, cross_vr2.passed,
+            )
+
     return {"front": front_bytes, "back": back_bytes}

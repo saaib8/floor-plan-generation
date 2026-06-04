@@ -2707,6 +2707,24 @@ if (btnCompose) {
       unit: 'm',
     };
 
+    // Collect floor furniture with explicit positions, rotations, dimensions
+    const floorLayout = S.surfaceLayouts['floor'];
+    const floorProducts = [];
+    if (floorLayout && floorLayout.placedProducts) {
+      const t = c2._transform;
+      floorLayout.placedProducts.forEach(pp => {
+        const x_m = t ? parseFloat(((pp.cx - t.ox + pp.wPx / 2) / t.sc).toFixed(3)) : null;
+        const y_m = t ? parseFloat(((pp.cy - t.oy + pp.hPx / 2) / t.sc).toFixed(3)) : null;
+        floorProducts.push({
+          product_name: pp.product.name || pp.product.category || '',
+          x_m,
+          y_m,
+          rotation: pp.rotation || 0,
+          dimensions: pp.product.dimensions || null,
+        });
+      });
+    }
+
     S.isComposing = true;
     updateComposeBtn();
     setStatus('Composing room… this may take a minute', 'processing');
@@ -2717,7 +2735,7 @@ if (btnCompose) {
       const res = await fetch('/api/compose', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ floor_image_url: floorUrl, wall_image_urls: wallImageUrls, room_dimensions: roomDimensions, presets: {}, openings: composeOpenings }),
+        body: JSON.stringify({ floor_image_url: floorUrl, wall_image_urls: wallImageUrls, room_dimensions: roomDimensions, presets: {}, openings: composeOpenings, floor_products: floorProducts.length ? floorProducts : undefined }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();

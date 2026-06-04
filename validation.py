@@ -848,3 +848,194 @@ def build_composition_correction_notes(validation: ValidationResult) -> str:
         )
 
     return "\n".join(lines)
+
+
+# ── Cross-view consistency validation ────────────────────────────────────────
+# Verifies that the front and back composite views depict the SAME room.
+
+CROSS_VIEW_VALIDATION_ENABLED = os.getenv(
+    "CROSS_VIEW_VALIDATION_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+CROSS_VIEW_SCORE_THRESHOLD = float(os.getenv("CROSS_VIEW_SCORE_THRESHOLD", "0.70"))
+
+
+def _build_cross_view_prompt(
+    expected_furniture_count: int,
+    shared_walls: List[str],
+) -> str:
+    """Prompt for GPT-4o to compare front and back views of the same room."""
+    shared = ", ".join(w.upper() for w in shared_walls) or "none"
+    return f"""You are a QA inspector comparing TWO renders of the EXACT SAME room from opposite camera angles.
+
+IMAGE 1 = Front view (camera at South-East corner, looking toward North-West).
+  Visible walls: North (back), East (right side), West (left side). South wall removed.
+
+IMAGE 2 = Back/opposite view (camera at North-West corner, looking toward South-East).
+  Visible walls: South (back), East (left side), West (right side). North wall removed.
+
+IMAGE 3 = Floor plan (ground truth for furniture count and positions).
+
+These MUST depict the EXACT same room. Only the camera position changes.
+
+Expected furniture count from the floor plan: {expected_furniture_count} item(s).
+
+SHARED WALLS visible in BOTH views: {shared}.
+These walls MUST show the SAME content (same windows, doors, decorations) in both views.
+
+## CHECKS
+
+1. FURNITURE COUNT
+   Count every distinct piece of furniture on the floor in IMAGE 1 and IMAGE 2.
+   Both counts should equal {expected_furniture_count} (from the floor plan).
+
+2. SHARED WALLS ({shared})
+   For each shared wall, check: same windows/doors, same wall-mounted items, same type of objects.
+
+3. FURNITURE IDENTITY
+   Same types of furniture in both views (if one has a sofa, the other must too).
+   No object-type substitutions (side table turned into a chair, etc.).
+
+4. FLOOR CONSISTENCY
+   Same flooring material and pattern in both views.
+
+5. EXTRA / MISSING OBJECTS
+   Neither view should contain furniture or wall decor absent from the other.
+
+Respond with ONLY valid JSON:
+{{
+  "furniture_count_front": <int>,
+  "furniture_count_back": <int>,
+  "counts_match": <bool>,
+  "shared_walls": [
+    {{"wall": "east", "consistent": <bool>, "notes": "..."}},
+    {{"wall": "west", "consistent": <bool>, "notes": "..."}}
+  ],
+  "furniture_types_match": <bool>,
+  "floor_consistent": <bool>,
+  "extra_objects_front": <int>,
+  "extra_objects_back": <int>,
+  "overall_consistent": <bool>,
+  "notes": "<brief summary of problems, if any>"
+}}"""
+
+
+def _parse_cross_view_response(raw_text: str) -> ValidationResult:
+    """Parse the GPT-4o cross-view comparison into a ValidationResult."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Could not parse cross-view validation JSON — returning pass-through")
+        return ValidationResult(score=0.5, passed=True, error="Unparseable JSON response")
+
+    counts_match = bool(data.get("counts_match", True))
+    furniture_match = bool(data.get("furniture_types_match", True))
+    floor_ok = bool(data.get("floor_consistent", True))
+    overall = bool(data.get("overall_consistent", True))
+    extra_front = int(data.get("extra_objects_front", 0))
+    extra_back = int(data.get("extra_objects_back", 0))
+
+    shared_walls_ok = True
+    shared_wall_checks: List[ProductValidation] = []
+    for sw in data.get("shared_walls", []):
+        ok = bool(sw.get("consistent", True))
+        shared_walls_ok = shared_walls_ok and ok
+        shared_wall_checks.append(ProductValidation(
+            product_id=str(sw.get("wall", "?")),
+            position_correct=ok,
+            size_correct=ok,
+            notes=sw.get("notes", ""),
+        ))
+
+    # Scoring: furniture count mismatch is the most critical failure.
+    score = 1.0
+    if not counts_match:
+        score -= 0.30
+    if not shared_walls_ok:
+        for sw in data.get("shared_walls", []):
+            if not bool(sw.get("consistent", True)):
+                score -= 0.15
+    if not furniture_match:
+        score -= 0.15
+    if not floor_ok:
+        score -= 0.05
+    score -= extra_front * 0.08
+    score -= extra_back * 0.08
+    score = max(0.0, min(1.0, score))
+
+    return ValidationResult(
+        score=round(score, 3),
+        passed=score >= CROSS_VIEW_SCORE_THRESHOLD,
+        product_checks=shared_wall_checks,
+        missing_items=abs(int(data.get("furniture_count_front", 0)) - int(data.get("furniture_count_back", 0))),
+        extra_items=extra_front + extra_back,
+        room_shape_correct=floor_ok,
+        openings_correct=shared_walls_ok,
+    )
+
+
+def validate_cross_view_consistency(
+    front_bytes: bytes,
+    back_bytes: bytes,
+    floor_bytes: bytes,
+    expected_furniture_count: int = 0,
+    shared_walls: Optional[List[str]] = None,
+) -> ValidationResult:
+    """Compare front and back composite views to verify they depict the same room.
+
+    Returns a ValidationResult with score and pass/fail. On any API error,
+    returns score=0.5/passed=True so the pipeline is never blocked.
+    """
+    if not CROSS_VIEW_VALIDATION_ENABLED:
+        return ValidationResult(score=1.0, passed=True)
+
+    try:
+        prompt = _build_cross_view_prompt(
+            expected_furniture_count=expected_furniture_count,
+            shared_walls=shared_walls or ["east", "west"],
+        )
+
+        content: List[dict] = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": _image_to_data_url(front_bytes), "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": _image_to_data_url(back_bytes), "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": _image_to_data_url(floor_bytes), "detail": "high"}},
+        ]
+
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {_openai_api_key()}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": VALIDATION_MODEL,
+                "messages": [{"role": "user", "content": content}],
+                "temperature": 0.1,
+                "max_tokens": 1500,
+            },
+            timeout=VALIDATION_TIMEOUT,
+        )
+
+        if not response.ok:
+            logger.warning(
+                "Cross-view validation API error %s: %s — returning pass-through",
+                response.status_code, response.text[:500],
+            )
+            return ValidationResult(score=0.5, passed=True, error=f"API error {response.status_code}")
+
+        raw_text = response.json()["choices"][0]["message"]["content"]
+        result = _parse_cross_view_response(raw_text)
+        logger.info(
+            "Cross-view validation: score=%.3f passed=%s missing=%d extra=%d",
+            result.score, result.passed, result.missing_items, result.extra_items,
+        )
+        return result
+
+    except Exception as exc:
+        logger.warning("Cross-view validation failed (%s) — returning pass-through", exc)
+        return ValidationResult(score=0.5, passed=True, error=str(exc))
