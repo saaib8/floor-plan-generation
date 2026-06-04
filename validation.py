@@ -35,7 +35,7 @@ COMPOSITION_VALIDATION_ENABLED = os.getenv(
     "COMPOSITION_VALIDATION_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
 COMPOSITION_MAX_ATTEMPTS = int(os.getenv("COMPOSITION_MAX_ATTEMPTS", "2"))
-COMPOSITION_CANDIDATES_PER_ATTEMPT = int(os.getenv("COMPOSITION_CANDIDATES_PER_ATTEMPT", "2"))
+COMPOSITION_CANDIDATES_PER_ATTEMPT = int(os.getenv("COMPOSITION_CANDIDATES_PER_ATTEMPT", "3"))
 COMPOSITION_SCORE_THRESHOLD = float(os.getenv("COMPOSITION_SCORE_THRESHOLD", "0.80"))
 
 
@@ -727,7 +727,7 @@ def _parse_composition_validation_response(raw_text: str) -> ValidationResult:
     score -= mirrored_walls * 0.30
     score -= migrated * 0.25
     score -= missing * 0.20
-    score -= extra * 0.10
+    score -= extra * 0.25
     if not openings_ok:
         score -= 0.15
     if not floor_ok:
@@ -746,6 +746,236 @@ def _parse_composition_validation_response(raw_text: str) -> ValidationResult:
     )
 
 
+def _build_manifest_validation_prompt(manifest) -> str:
+    """Build a GPT-4o validation prompt using the structured ViewManifest.
+
+    Instead of comparing images against images, the validator checks the composite
+    against an authoritative object manifest with IDs, types, and wall bindings.
+    """
+    # Build the must-appear checklist
+    floor_checklist = []
+    for obj in manifest.floor_objects:
+        floor_checklist.append(f"    {obj.id}: {obj.name} (floor)")
+
+    wall_checklist = []
+    for compass in manifest.visible_walls:
+        for obj in manifest.wall_objects_by_wall.get(compass, []):
+            wall_checklist.append(f"    {obj.id}: {obj.name} ({compass.upper()} wall)")
+        for obj in manifest.openings_by_wall.get(compass, []):
+            wall_checklist.append(f"    {obj.id}: {obj.name} ({compass.upper()} wall)")
+
+    all_items = floor_checklist + wall_checklist
+    items_block = "\n".join(all_items) if all_items else "    (no items)"
+
+    total = len(manifest.must_appear)
+
+    must_not_block = ""
+    if manifest.must_not_appear:
+        must_not_block = (
+            f"\n\nMUST NOT APPEAR (belong to the removed {manifest.removed_wall.upper()} wall):\n"
+            + "\n".join(f"    {mid}" for mid in manifest.must_not_appear)
+        )
+
+    # Build floor furniture count for explicit checking
+    floor_count = len(manifest.floor_objects)
+    floor_names = ", ".join(f"{obj.id}={obj.name}" for obj in manifest.floor_objects) if manifest.floor_objects else "none"
+
+    return f"""You are a strict QA inspector for an interior-design composite render.
+
+IMAGE 1 = a generated open-box "dollhouse" render ({manifest.view_name.upper()} view) — this is what you judge.
+IMAGE 2 = the floor render (furniture ground truth).
+IMAGE 3+ = wall elevation images for reference.
+
+## AUTHORITATIVE OBJECT MANIFEST — {total} objects must be visible
+
+For each object listed below, check whether it is PRESENT, has the CORRECT TYPE (not substituted),
+and is on the CORRECT WALL (not migrated). Use the ID to track each object.
+
+{items_block}{must_not_block}
+
+## FLOOR FURNITURE AUDIT — exactly {floor_count} floor item(s)
+
+The floor must contain EXACTLY {floor_count} piece(s) of furniture: {floor_names}.
+Count the floor furniture in IMAGE 1 carefully:
+- If you count MORE than {floor_count}, there are hallucinated/companion items (extra chairs, stools, lamps).
+- If you count FEWER than {floor_count}, items are missing.
+- Check each floor item's orientation/facing direction against IMAGE 2.
+- Flag any "companion" objects NOT in the manifest — common hallucinations include:
+  office chairs next to desks, chairs around tables, nightstands next to beds, lamps next to sofas.
+
+## CHECKS
+
+For each object in the manifest:
+1. PRESENT: Is this object visible in IMAGE 1?
+2. CORRECT_TYPE: Is it the right kind of object (not substituted)?
+3. CORRECT_WALL: Is it on the correct wall (not migrated to another wall)?
+
+Also check:
+- EXTRA OBJECTS: Are there objects in IMAGE 1 that are NOT in the manifest? Count carefully — companion
+  furniture (chairs with desks, lamps with sofas) is the most common hallucination.
+- MIRRORED: Is any wall's content left-right reversed compared to the elevation?
+- FLOOR FURNITURE COUNT: Does the floor have exactly {floor_count} items? Report in "furniture_count".
+- ORIENTATION: Does each floor item face the same direction as in IMAGE 2? Report wrong count in "orientation_wrong_count".
+
+Respond with ONLY valid JSON:
+{{
+  "objects": [
+    {{"id": "F1", "present": true, "correct_type": true, "correct_wall": true, "notes": ""}},
+    {{"id": "W_N1", "present": true, "correct_type": true, "correct_wall": true, "notes": ""}}
+  ],
+  "extra_items": 0,
+  "mirrored_walls": 0,
+  "floor_furniture_correct": true,
+  "furniture_count": {floor_count},
+  "orientation_wrong_count": 0,
+  "overall_notes": "brief summary"
+}}"""
+
+
+def _parse_manifest_validation_response(raw_text: str, manifest) -> ValidationResult:
+    """Parse GPT-4o manifest-based validation response into a ValidationResult."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Could not parse manifest validation JSON — returning pass-through")
+        return ValidationResult(score=0.5, passed=True, error="Unparseable JSON response")
+
+    product_checks: List[ProductValidation] = []
+    missing_count = 0
+    migrated_count = 0
+    type_mismatch_count = 0
+
+    must_appear_set = set(manifest.must_appear)
+    checked_ids = set()
+
+    for obj_data in data.get("objects", []):
+        oid = obj_data.get("id", "?")
+        checked_ids.add(oid)
+        present = bool(obj_data.get("present", True))
+        correct_type = bool(obj_data.get("correct_type", True))
+        correct_wall = bool(obj_data.get("correct_wall", True))
+
+        if not present:
+            missing_count += 1
+        if not correct_type:
+            type_mismatch_count += 1
+        if not correct_wall:
+            migrated_count += 1
+
+        product_checks.append(ProductValidation(
+            product_id=oid,
+            position_correct=correct_wall and present,
+            size_correct=correct_type and present,
+            notes=obj_data.get("notes", ""),
+        ))
+
+    # Count objects in must_appear that weren't even checked
+    for mid in must_appear_set:
+        if mid not in checked_ids:
+            missing_count += 1
+            product_checks.append(ProductValidation(
+                product_id=mid,
+                position_correct=False,
+                size_correct=False,
+                notes="Not found in validation response — likely missing",
+            ))
+
+    extra = int(data.get("extra_items", 0))
+    mirrored = int(data.get("mirrored_walls", 0))
+    floor_ok = bool(data.get("floor_furniture_correct", True))
+
+    # Scoring per the plan:
+    # -0.15/missing, -0.25/migrated, -0.15/type mismatch, -0.25/extra, -0.20/mirrored
+    score = 1.0
+    score -= missing_count * 0.15
+    score -= migrated_count * 0.25
+    score -= type_mismatch_count * 0.15
+    score -= extra * 0.25
+    score -= mirrored * 0.20
+    if not floor_ok:
+        score -= 0.15
+
+    # Penalty for furniture orientation failures
+    orientation_wrong = int(data.get("orientation_wrong_count", 0))
+    score -= orientation_wrong * 0.15
+
+    score = max(0.0, min(1.0, score))
+
+    return ValidationResult(
+        score=round(score, 3),
+        passed=score >= COMPOSITION_SCORE_THRESHOLD,
+        product_checks=product_checks,
+        missing_items=missing_count,
+        extra_items=extra + migrated_count,
+        room_shape_correct=floor_ok,
+        openings_correct=(migrated_count == 0),
+    )
+
+
+def validate_against_manifest(
+    composite_bytes: bytes,
+    manifest,
+    floor_bytes: bytes,
+    wall_items: List[Tuple[str, bytes]],
+) -> ValidationResult:
+    """Validate a composite against the structured ViewManifest.
+
+    Uses per-object presence/type/wall checks instead of pixel-to-pixel comparison.
+    On any failure returns score=0.5/passed=True so composition is never blocked.
+    """
+    try:
+        prompt = _build_manifest_validation_prompt(manifest)
+
+        content: List[dict] = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": _image_to_data_url(composite_bytes), "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": _image_to_data_url(floor_bytes), "detail": "high"}},
+        ]
+        for _compass, elev_bytes in wall_items:
+            content.append(
+                {"type": "image_url", "image_url": {"url": _image_to_data_url(elev_bytes), "detail": "high"}}
+            )
+
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {_openai_api_key()}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": VALIDATION_MODEL,
+                "messages": [{"role": "user", "content": content}],
+                "temperature": 0.1,
+                "max_tokens": 2000,
+            },
+            timeout=VALIDATION_TIMEOUT,
+        )
+
+        if not response.ok:
+            logger.warning(
+                "Manifest validation API error %s: %s — returning pass-through",
+                response.status_code, response.text[:500],
+            )
+            return ValidationResult(score=0.5, passed=True, error=f"API error {response.status_code}")
+
+        raw_text = response.json()["choices"][0]["message"]["content"]
+        result = _parse_manifest_validation_response(raw_text, manifest)
+        logger.info(
+            "Manifest validation: score=%.3f passed=%s missing=%d extra=%d",
+            result.score, result.passed, result.missing_items, result.extra_items,
+        )
+        return result
+
+    except Exception as exc:
+        logger.warning("Manifest validation failed (%s) — returning pass-through", exc)
+        return ValidationResult(score=0.5, passed=True, error=str(exc))
+
+
 def validate_composition_accuracy(
     composite_bytes: bytes,
     floor_bytes: bytes,
@@ -753,6 +983,7 @@ def validate_composition_accuracy(
     view: str,
     visible_walls: Optional[List[str]] = None,
     openings_by_wall: Optional[Dict[str, List[Dict]]] = None,
+    view_manifest=None,
 ) -> ValidationResult:
     """Compare a dollhouse composite against the floor render + each wall elevation,
     using the authoritative per-wall openings as ground truth.
@@ -760,8 +991,16 @@ def validate_composition_accuracy(
     wall_items:       (compass, elevation_bytes) for DESIGNED walls in this view (have images).
     visible_walls:    ALL walls visible in this view (designed or not) — for opening checks.
     openings_by_wall: authoritative {compass: [opening,...]} ground truth.
+    view_manifest:    when provided with wall art data, uses manifest-based validation.
     On any failure returns score=0.5/passed=True so composition is never blocked.
     """
+    # Use manifest-based validation when we have structured wall art data
+    if (view_manifest is not None
+            and view_manifest.total_wall_art_count > 0):
+        return validate_against_manifest(
+            composite_bytes, view_manifest, floor_bytes, wall_items,
+        )
+
     try:
         designed_walls = [c for c, _ in wall_items]
         all_visible = visible_walls or designed_walls
@@ -848,194 +1087,3 @@ def build_composition_correction_notes(validation: ValidationResult) -> str:
         )
 
     return "\n".join(lines)
-
-
-# ── Cross-view consistency validation ────────────────────────────────────────
-# Verifies that the front and back composite views depict the SAME room.
-
-CROSS_VIEW_VALIDATION_ENABLED = os.getenv(
-    "CROSS_VIEW_VALIDATION_ENABLED", "true"
-).lower() in ("true", "1", "yes")
-CROSS_VIEW_SCORE_THRESHOLD = float(os.getenv("CROSS_VIEW_SCORE_THRESHOLD", "0.70"))
-
-
-def _build_cross_view_prompt(
-    expected_furniture_count: int,
-    shared_walls: List[str],
-) -> str:
-    """Prompt for GPT-4o to compare front and back views of the same room."""
-    shared = ", ".join(w.upper() for w in shared_walls) or "none"
-    return f"""You are a QA inspector comparing TWO renders of the EXACT SAME room from opposite camera angles.
-
-IMAGE 1 = Front view (camera at South-East corner, looking toward North-West).
-  Visible walls: North (back), East (right side), West (left side). South wall removed.
-
-IMAGE 2 = Back/opposite view (camera at North-West corner, looking toward South-East).
-  Visible walls: South (back), East (left side), West (right side). North wall removed.
-
-IMAGE 3 = Floor plan (ground truth for furniture count and positions).
-
-These MUST depict the EXACT same room. Only the camera position changes.
-
-Expected furniture count from the floor plan: {expected_furniture_count} item(s).
-
-SHARED WALLS visible in BOTH views: {shared}.
-These walls MUST show the SAME content (same windows, doors, decorations) in both views.
-
-## CHECKS
-
-1. FURNITURE COUNT
-   Count every distinct piece of furniture on the floor in IMAGE 1 and IMAGE 2.
-   Both counts should equal {expected_furniture_count} (from the floor plan).
-
-2. SHARED WALLS ({shared})
-   For each shared wall, check: same windows/doors, same wall-mounted items, same type of objects.
-
-3. FURNITURE IDENTITY
-   Same types of furniture in both views (if one has a sofa, the other must too).
-   No object-type substitutions (side table turned into a chair, etc.).
-
-4. FLOOR CONSISTENCY
-   Same flooring material and pattern in both views.
-
-5. EXTRA / MISSING OBJECTS
-   Neither view should contain furniture or wall decor absent from the other.
-
-Respond with ONLY valid JSON:
-{{
-  "furniture_count_front": <int>,
-  "furniture_count_back": <int>,
-  "counts_match": <bool>,
-  "shared_walls": [
-    {{"wall": "east", "consistent": <bool>, "notes": "..."}},
-    {{"wall": "west", "consistent": <bool>, "notes": "..."}}
-  ],
-  "furniture_types_match": <bool>,
-  "floor_consistent": <bool>,
-  "extra_objects_front": <int>,
-  "extra_objects_back": <int>,
-  "overall_consistent": <bool>,
-  "notes": "<brief summary of problems, if any>"
-}}"""
-
-
-def _parse_cross_view_response(raw_text: str) -> ValidationResult:
-    """Parse the GPT-4o cross-view comparison into a ValidationResult."""
-    text = raw_text.strip()
-    if text.startswith("```"):
-        lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
-        text = "\n".join(lines)
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        logger.warning("Could not parse cross-view validation JSON — returning pass-through")
-        return ValidationResult(score=0.5, passed=True, error="Unparseable JSON response")
-
-    counts_match = bool(data.get("counts_match", True))
-    furniture_match = bool(data.get("furniture_types_match", True))
-    floor_ok = bool(data.get("floor_consistent", True))
-    overall = bool(data.get("overall_consistent", True))
-    extra_front = int(data.get("extra_objects_front", 0))
-    extra_back = int(data.get("extra_objects_back", 0))
-
-    shared_walls_ok = True
-    shared_wall_checks: List[ProductValidation] = []
-    for sw in data.get("shared_walls", []):
-        ok = bool(sw.get("consistent", True))
-        shared_walls_ok = shared_walls_ok and ok
-        shared_wall_checks.append(ProductValidation(
-            product_id=str(sw.get("wall", "?")),
-            position_correct=ok,
-            size_correct=ok,
-            notes=sw.get("notes", ""),
-        ))
-
-    # Scoring: furniture count mismatch is the most critical failure.
-    score = 1.0
-    if not counts_match:
-        score -= 0.30
-    if not shared_walls_ok:
-        for sw in data.get("shared_walls", []):
-            if not bool(sw.get("consistent", True)):
-                score -= 0.15
-    if not furniture_match:
-        score -= 0.15
-    if not floor_ok:
-        score -= 0.05
-    score -= extra_front * 0.08
-    score -= extra_back * 0.08
-    score = max(0.0, min(1.0, score))
-
-    return ValidationResult(
-        score=round(score, 3),
-        passed=score >= CROSS_VIEW_SCORE_THRESHOLD,
-        product_checks=shared_wall_checks,
-        missing_items=abs(int(data.get("furniture_count_front", 0)) - int(data.get("furniture_count_back", 0))),
-        extra_items=extra_front + extra_back,
-        room_shape_correct=floor_ok,
-        openings_correct=shared_walls_ok,
-    )
-
-
-def validate_cross_view_consistency(
-    front_bytes: bytes,
-    back_bytes: bytes,
-    floor_bytes: bytes,
-    expected_furniture_count: int = 0,
-    shared_walls: Optional[List[str]] = None,
-) -> ValidationResult:
-    """Compare front and back composite views to verify they depict the same room.
-
-    Returns a ValidationResult with score and pass/fail. On any API error,
-    returns score=0.5/passed=True so the pipeline is never blocked.
-    """
-    if not CROSS_VIEW_VALIDATION_ENABLED:
-        return ValidationResult(score=1.0, passed=True)
-
-    try:
-        prompt = _build_cross_view_prompt(
-            expected_furniture_count=expected_furniture_count,
-            shared_walls=shared_walls or ["east", "west"],
-        )
-
-        content: List[dict] = [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": _image_to_data_url(front_bytes), "detail": "high"}},
-            {"type": "image_url", "image_url": {"url": _image_to_data_url(back_bytes), "detail": "high"}},
-            {"type": "image_url", "image_url": {"url": _image_to_data_url(floor_bytes), "detail": "high"}},
-        ]
-
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {_openai_api_key()}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": VALIDATION_MODEL,
-                "messages": [{"role": "user", "content": content}],
-                "temperature": 0.1,
-                "max_tokens": 1500,
-            },
-            timeout=VALIDATION_TIMEOUT,
-        )
-
-        if not response.ok:
-            logger.warning(
-                "Cross-view validation API error %s: %s — returning pass-through",
-                response.status_code, response.text[:500],
-            )
-            return ValidationResult(score=0.5, passed=True, error=f"API error {response.status_code}")
-
-        raw_text = response.json()["choices"][0]["message"]["content"]
-        result = _parse_cross_view_response(raw_text)
-        logger.info(
-            "Cross-view validation: score=%.3f passed=%s missing=%d extra=%d",
-            result.score, result.passed, result.missing_items, result.extra_items,
-        )
-        return result
-
-    except Exception as exc:
-        logger.warning("Cross-view validation failed (%s) — returning pass-through", exc)
-        return ValidationResult(score=0.5, passed=True, error=str(exc))

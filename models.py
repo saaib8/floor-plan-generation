@@ -7,8 +7,54 @@ from pydantic import BaseModel
 # Canonical room representation used by both composite views. Every view is
 # derived from the SAME scene — only the camera position changes.
 
-_COMPASS_SWAP = {"north": "south", "south": "north", "east": "west", "west": "east"}
 
+# ── SceneObject — unified registry entry for any room object ─────────────────
+
+@dataclass
+class SceneObject:
+    """A single object in the room: floor furniture, wall art, or opening."""
+    id: str              # "F1", "W_N1", "OPEN_E_WIN1"
+    name: str            # "Work Desk", "Abstract Canvas", "Window"
+    obj_type: str        # "floor_furniture" | "wall_art" | "window" | "door"
+    binding: str         # "floor" | "north" | "south" | "east" | "west"
+    # Floor items
+    x_m: Optional[float] = None
+    y_m: Optional[float] = None
+    rotation: int = 0
+    width_m: float = 0.0
+    depth_m: float = 0.0
+    # Wall items
+    x_along_wall_m: Optional[float] = None
+    y_from_floor_m: Optional[float] = None
+    height_m: float = 0.0
+    # Metadata
+    category: str = ""
+    product_id: Optional[int] = None
+
+
+# ── ViewManifest — what a specific camera view must show ─────────────────────
+
+@dataclass
+class ViewManifest:
+    """Authoritative manifest for a single camera view (front or back)."""
+    view_name: str                                    # "front" | "back"
+    removed_wall: str
+    visible_walls: List[str] = field(default_factory=list)
+    floor_objects: List[SceneObject] = field(default_factory=list)
+    wall_objects_by_wall: Dict[str, List[SceneObject]] = field(default_factory=dict)
+    openings_by_wall: Dict[str, List[SceneObject]] = field(default_factory=dict)
+    must_appear: List[str] = field(default_factory=list)
+    must_not_appear: List[str] = field(default_factory=list)
+    total_floor_count: int = 0
+    total_wall_art_count: int = 0
+    total_openings_count: int = 0
+    wall_summaries: Dict[str, str] = field(default_factory=dict)
+    room_width_m: float = 0.0
+    room_depth_m: float = 0.0
+    wall_height_m: float = 0.0
+
+
+# ── RoomScene — canonical room data ─────────────────────────────────────────
 
 @dataclass
 class RoomScene:
@@ -21,75 +67,152 @@ class RoomScene:
     openings: Dict[str, List[Dict]]           # compass → opening specs
     floor_products: List[Dict]                # [{product_name, x_m, y_m, rotation, dimensions}]
     wall_color: str = "#F3EFE8"
+    wall_products: Optional[List[Dict]] = None
+    _object_registry: Optional[List[SceneObject]] = field(default=None, repr=False)
 
-    def camera_view(self, removed_wall: str) -> "CameraViewData":
-        """Derive a camera-specific view from this canonical scene.
+    def build_object_registry(self) -> List[SceneObject]:
+        """Build a unified object registry with stable IDs.
 
-        For the front view (remove south), data passes through unchanged.
-        For the back view (remove north), all coordinates and compass labels
-        are transformed by 180° so the model can use its front-view priors.
+        Assigns IDs:
+        - F1, F2, ... for floor furniture
+        - W_N1, W_N2, ... for wall art per compass
+        - OPEN_E_WIN1, OPEN_N_DOOR1, ... for openings
+        Caches the result so repeated calls return the same list.
         """
-        is_front = removed_wall.lower() == "south"
+        if self._object_registry is not None:
+            return self._object_registry
 
-        if is_front:
-            return CameraViewData(
-                removed_wall="south",
-                prompt_removed_wall="south",
-                visible_walls=["north", "east", "west"],
-                wall_images={
-                    "north": self.walls.get("north"),
-                    "south": None,   # removed
-                    "east": self.walls.get("east"),
-                    "west": self.walls.get("west"),
-                },
-                floor_products=list(self.floor_products),
-                openings_by_wall=dict(self.openings),
-                rotate_floor=False,
-            )
+        registry: List[SceneObject] = []
 
-        # Back view: 180° transform — swap compass labels so the model
-        # can use the standard front-view prompt (remove "south").
-        swapped_walls = {
-            "north": self.walls.get("south"),    # South → "North" slot (back wall)
-            "south": None,                        # "South" = removed
-            "east":  self.walls.get("west"),      # West → "East" slot (right side)
-            "west":  self.walls.get("east"),      # East → "West" slot (left side)
-        }
+        # Floor products → F1, F2, ...
+        for idx, fp in enumerate(self.floor_products):
+            dims = fp.get("dimensions") or {}
+            registry.append(SceneObject(
+                id=f"F{idx + 1}",
+                name=fp.get("product_name") or "item",
+                obj_type="floor_furniture",
+                binding="floor",
+                x_m=float(fp.get("x_m") or 0),
+                y_m=float(fp.get("y_m") or 0),
+                rotation=int(fp.get("rotation") or 0) % 360,
+                width_m=float(dims.get("width") or 0),
+                depth_m=float(dims.get("depth") or dims.get("height") or 0),
+                category=fp.get("category") or "",
+            ))
 
-        swapped_openings: Dict[str, List[Dict]] = {}
+        # Wall products → W_N1, W_N2, ... per compass
+        wall_counters: Dict[str, int] = {}
+        for wp in (self.wall_products or []):
+            compass = (wp.get("wall_compass") or "").lower()
+            if compass not in ("north", "south", "east", "west"):
+                continue
+            key = compass[0].upper()
+            wall_counters[key] = wall_counters.get(key, 0) + 1
+            registry.append(SceneObject(
+                id=f"W_{key}{wall_counters[key]}",
+                name=wp.get("product_name") or "wall item",
+                obj_type="wall_art",
+                binding=compass,
+                x_along_wall_m=float(wp.get("x_m") or 0),
+                y_from_floor_m=float(wp.get("y_from_floor_m") or 0),
+                width_m=float(wp.get("width_m") or 0),
+                height_m=float(wp.get("height_m") or 0),
+                category=wp.get("category") or "",
+            ))
+
+        # Openings → OPEN_E_WIN1, OPEN_N_DOOR1, ...
+        opening_counters: Dict[str, int] = {}
         for compass, ops in self.openings.items():
-            swapped_openings[_COMPASS_SWAP.get(compass, compass)] = ops
+            c_key = compass[0].upper()
+            for op in ops:
+                otype = (op.get("type") or "opening").lower()
+                type_key = "WIN" if "win" in otype else "DOOR" if "door" in otype else "OPEN"
+                counter_key = f"{c_key}_{type_key}"
+                opening_counters[counter_key] = opening_counters.get(counter_key, 0) + 1
+                registry.append(SceneObject(
+                    id=f"OPEN_{c_key}_{type_key}{opening_counters[counter_key]}",
+                    name=otype.capitalize(),
+                    obj_type=otype if otype in ("window", "door") else "opening",
+                    binding=compass,
+                    x_along_wall_m=float(op.get("position_from_left") or 0),
+                    width_m=float(op.get("width_m") or op.get("width") or 0),
+                    height_m=float(op.get("height") or (0.9 if "win" in otype else 2.1)),
+                    y_from_floor_m=float(op.get("sill_height") or (1.2 if "win" in otype else 0)),
+                ))
 
-        flipped_products = []
-        for fp in self.floor_products:
-            item = dict(fp)
-            item["x_m"] = self.room_width_m - float(item.get("x_m") or 0)
-            item["y_m"] = self.room_depth_m - float(item.get("y_m") or 0)
-            item["rotation"] = (int(item.get("rotation") or 0) + 180) % 360
-            flipped_products.append(item)
+        self._object_registry = registry
+        return registry
 
-        return CameraViewData(
-            removed_wall="north",
-            prompt_removed_wall="south",   # trick: use front-view prompt
-            visible_walls=["south", "east", "west"],
-            wall_images=swapped_walls,
-            floor_products=flipped_products,
-            openings_by_wall=swapped_openings,
-            rotate_floor=True,
+    def view_manifest(self, removed_wall: str) -> ViewManifest:
+        """Build a ViewManifest for a specific camera view.
+
+        removed_wall: "south" for front view, "north" for back view.
+        """
+        registry = self.build_object_registry()
+        removed = removed_wall.lower()
+        is_front = removed == "south"
+        view_name = "front" if is_front else "back"
+
+        visible_walls = [c for c in ("north", "south", "east", "west") if c != removed]
+
+        floor_objects: List[SceneObject] = []
+        wall_objects_by_wall: Dict[str, List[SceneObject]] = {c: [] for c in visible_walls}
+        openings_by_wall_so: Dict[str, List[SceneObject]] = {c: [] for c in visible_walls}
+        must_appear: List[str] = []
+        must_not_appear: List[str] = []
+
+        for obj in registry:
+            if obj.obj_type == "floor_furniture":
+                # All floor objects are visible in every view
+                floor_objects.append(obj)
+                must_appear.append(obj.id)
+            elif obj.obj_type == "wall_art":
+                if obj.binding == removed:
+                    must_not_appear.append(obj.id)
+                elif obj.binding in wall_objects_by_wall:
+                    wall_objects_by_wall[obj.binding].append(obj)
+                    must_appear.append(obj.id)
+            elif obj.obj_type in ("window", "door", "opening"):
+                if obj.binding == removed:
+                    must_not_appear.append(obj.id)
+                elif obj.binding in openings_by_wall_so:
+                    openings_by_wall_so[obj.binding].append(obj)
+                    must_appear.append(obj.id)
+
+        # Build per-wall summary strings
+        wall_summaries: Dict[str, str] = {}
+        for c in visible_walls:
+            parts = []
+            wall_arts = wall_objects_by_wall.get(c, [])
+            wall_opens = openings_by_wall_so.get(c, [])
+            if wall_arts:
+                parts.append(f"{len(wall_arts)} wall item(s)")
+            if wall_opens:
+                parts.append(f"{len(wall_opens)} opening(s)")
+            if not parts:
+                parts.append("empty (bare wall)")
+            wall_summaries[c] = f"{c.upper()} wall: {', '.join(parts)}"
+
+        total_wall_art = sum(len(v) for v in wall_objects_by_wall.values())
+        total_openings = sum(len(v) for v in openings_by_wall_so.values())
+
+        return ViewManifest(
+            view_name=view_name,
+            removed_wall=removed,
+            visible_walls=visible_walls,
+            floor_objects=floor_objects,
+            wall_objects_by_wall=wall_objects_by_wall,
+            openings_by_wall=openings_by_wall_so,
+            must_appear=must_appear,
+            must_not_appear=must_not_appear,
+            total_floor_count=len(floor_objects),
+            total_wall_art_count=total_wall_art,
+            total_openings_count=total_openings,
+            wall_summaries=wall_summaries,
+            room_width_m=self.room_width_m,
+            room_depth_m=self.room_depth_m,
+            wall_height_m=self.wall_height_m,
         )
-
-
-@dataclass
-class CameraViewData:
-    """Transformed room data for a specific camera position."""
-    removed_wall: str                         # real compass of removed wall
-    prompt_removed_wall: str                  # compass used in the prompt template
-    visible_walls: List[str]                  # real compass labels of visible walls
-    wall_images: Dict[str, Optional[bytes]]   # prompt compass → image bytes (None=blank)
-    floor_products: List[Dict]                # transformed coordinates
-    openings_by_wall: Dict[str, List[Dict]]   # prompt compass → opening specs
-    rotate_floor: bool                        # whether the floor image needs 180° rotation
-
 
 class ProductItem(BaseModel):
     product_id: Optional[int] = None
@@ -147,6 +270,9 @@ class ComposeRequest(BaseModel):
     # Floor-placed furniture with explicit positions, rotations, dimensions.
     # Each item: {product_name, x_m, y_m, rotation, dimensions: {width, depth}}.
     floor_products: Optional[List[Dict[str, Any]]] = None
+    # Wall-mounted products with positions relative to their wall.
+    # Each item: {product_name, wall_compass, x_m, y_from_floor_m, width_m, height_m, category}.
+    wall_products: Optional[List[Dict[str, Any]]] = None
 
 
 class FloorPlanRequest(BaseModel):

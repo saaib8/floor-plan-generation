@@ -1475,6 +1475,7 @@ function saveSurfaceLayout() {
   S.surfaceLayouts[key] = {
     placedProducts: S.placedProducts.map(pp => ({ ...pp })),
     colorIdx: S.colorIdx,
+    transform: c2._transform ? { ...c2._transform } : null,
   };
 }
 
@@ -2241,10 +2242,10 @@ async function pollGeneration(genId, surfaceKey) {
 
 const VIEW_LABELS = {
   isometric: 'Top View', elevation: 'Wall Elevation',
-  composition_front: 'Room View', composition_back: 'Opposite View',
+  composition_front: 'Room View',
 };
 const VIEW_ORDER  = ['isometric', 'elevation'];
-const COMPOSITE_ORDER = ['composition_front', 'composition_back'];
+const COMPOSITE_ORDER = ['composition_front'];
 
 // Lightbox: clicking a result image opens it full-screen
 function openLightbox(src) {
@@ -2725,6 +2726,32 @@ if (btnCompose) {
       });
     }
 
+    // Collect wall-mounted products from all wall_<id> surface layouts
+    const wallProducts = [];
+    for (const [key, layout] of Object.entries(S.surfaceLayouts)) {
+      if (!key.startsWith('wall_')) continue;
+      if (!layout || !layout.placedProducts || !layout.placedProducts.length) continue;
+      const wallId = parseInt(key.slice(5));
+      const wall = S.walls.find(w => w.id === wallId);
+      if (!wall) continue;
+      const compass = wallToCompass(wall);
+      const t = layout.transform;
+      if (!t) continue;
+      layout.placedProducts.forEach(pp => {
+        const x_m = parseFloat(((pp.cx - t.ox + pp.wPx / 2) / t.sc).toFixed(3));
+        const y_from_top = parseFloat(((pp.cy - t.oy + pp.hPx / 2) / t.sc).toFixed(3));
+        wallProducts.push({
+          product_name: pp.product.name || pp.product.category || '',
+          wall_compass: compass,
+          x_m,
+          y_from_floor_m: parseFloat((DEFAULT_WALL_H - y_from_top).toFixed(3)),
+          width_m:  parseFloat((pp.wPx / t.sc).toFixed(3)),
+          height_m: parseFloat((pp.hPx / t.sc).toFixed(3)),
+          category: pp.product.category || '',
+        });
+      });
+    }
+
     S.isComposing = true;
     updateComposeBtn();
     setStatus('Composing room… this may take a minute', 'processing');
@@ -2735,7 +2762,7 @@ if (btnCompose) {
       const res = await fetch('/api/compose', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ floor_image_url: floorUrl, wall_image_urls: wallImageUrls, room_dimensions: roomDimensions, presets: {}, openings: composeOpenings, floor_products: floorProducts.length ? floorProducts : undefined }),
+        body: JSON.stringify({ floor_image_url: floorUrl, wall_image_urls: wallImageUrls, room_dimensions: roomDimensions, presets: {}, openings: composeOpenings, floor_products: floorProducts.length ? floorProducts : undefined, wall_products: wallProducts.length ? wallProducts : undefined }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();

@@ -1651,29 +1651,73 @@ def _build_wall_content_inventory(
     visible_walls: List[str],
     removed_wall: str,
 ) -> str:
-    """Build an explicit per-wall content inventory so the model knows EXACTLY what
-    each visible wall should contain (doors, windows) and what it should NOT contain."""
+    """Build an explicit per-wall content inventory with image references.
+
+    Each visible wall gets:
+    1. Its Image number reference (so the model knows which image to look at)
+    2. Structural openings from data (windows/doors) — authoritative count
+    3. Explicit instruction to reproduce ALL visual content from that wall's image
+       (art, canvases, frames, shelves, sconces, etc.)
+    4. A checklist entry for verification
+    """
     ob = openings_by_wall or {}
+
+    # Map compass → Image number (fixed by the prompt template's IMAGE MAPPING).
+    # The image order is always: [floor, north, south, east, west] = Images 1-5.
+    _compass_to_image = {"north": 2, "south": 3, "east": 4, "west": 5}
+
     lines = [
-        "WALL CONTENT INVENTORY — render ONLY what is listed below for each wall",
-        "Each wall's content comes ONLY from its own wall image. Do NOT add any "
-        "art, frames, mirrors, shelves, sconces, or decorations beyond what that "
-        "wall's image shows. A bare wall image means a BARE wall — keep it bare.",
+        "WALL CONTENT INVENTORY — per-wall rendering requirements",
+        "",
+        "CRITICAL: Each wall's elevation image is the COMPLETE visual authority for that wall.",
+        "You MUST reproduce EVERY element visible in each wall's image, including:",
+        "  • Architectural openings (windows, doors) — counts listed below",
+        "  • Wall-mounted art, paintings, canvases, framed prints, triptychs",
+        "  • Shelves, sconces, mirrors, clocks, or any mounted decoration",
+        "  • Wall texture, color, trim, molding, wainscoting",
+        "If you see it in the wall image, it MUST appear on that wall in the output.",
+        "Do NOT transfer any element between walls. Each wall's content stays on its own wall.",
+        "",
     ]
+
+    checklist_items = []
+
     for compass in visible_walls:
         C = compass.upper()
+        img_num = _compass_to_image.get(compass, "?")
         ops = ob.get(compass) or []
+
+        # Opening summary
         if ops:
             parts = []
             for o in ops:
                 otype = (o.get("type") or "opening").lower()
                 parts.append(otype)
-            summary = ", ".join(f"1 {p}" for p in parts)
-            lines.append(f"- {C} wall: {summary}. Render ONLY these openings plus what Image shows.")
+            opening_summary = ", ".join(f"1 {p}" for p in parts)
+            opening_count = len(ops)
+            opening_line = f"  Openings: {opening_summary} ({opening_count} total)"
         else:
-            lines.append(
-                f"- {C} wall: SOLID — NO windows, NO doors, NO openings whatsoever. "
-                f"Do NOT add any window or door to this wall."
+            opening_line = "  Openings: NONE — this wall has no windows or doors. Do NOT add any."
+
+        lines.append(f"- {C} wall (Image {img_num}):")
+        lines.append(opening_line)
+        lines.append(
+            f"  Visual content: Reproduce EVERYTHING visible in Image {img_num} — "
+            f"all art, frames, canvases, decorations, texture, and trim. "
+            f"Missing even one element is a failure."
+        )
+        lines.append("")
+
+        # Checklist entry
+        if ops:
+            checklist_items.append(
+                f"  [ ] {C} wall (Image {img_num}): {opening_count} opening(s) rendered? "
+                f"ALL art/frames/decor from Image {img_num} reproduced?"
+            )
+        else:
+            checklist_items.append(
+                f"  [ ] {C} wall (Image {img_num}): No openings added? "
+                f"ALL art/frames/decor from Image {img_num} reproduced?"
             )
 
     R = removed_wall.upper()
@@ -1681,6 +1725,17 @@ def _build_wall_content_inventory(
         f"- {R} wall: REMOVED (open side toward camera). Do NOT draw this wall. "
         f"Do NOT place its windows, doors, or content on any other wall."
     )
+
+    # Wall content checklist — forces the model to verify each wall
+    lines.append("")
+    lines.append(f"WALL CONTENT CHECKLIST — verify EACH wall before finalizing:")
+    for item in checklist_items:
+        lines.append(item)
+    lines.append(
+        "If ANY wall is missing art, frames, windows, or doors that its image shows, "
+        "you have failed. Re-examine each wall image and correct omissions."
+    )
+
     return "\n".join(lines)
 
 
@@ -1925,19 +1980,22 @@ def build_geometric_composite_prompt(
     presets: Optional[Dict] = None,
     floor_products: Optional[List[Dict]] = None,
     has_style_ref: bool = False,
+    elevation_image_refs: Optional[Dict[str, int]] = None,
+    style_ref_image_num: Optional[int] = None,
 ) -> str:
-    """Prompt for the DETERMINISTIC COMPOSITE backend.
+    """Prompt for the DETERMINISTIC COMPOSITE backend (hybrid approach).
 
-    IMAGE 1 is a pre-composited dollhouse view where:
-    - The room structure (camera, walls, floor) is computed and correct
-    - Wall elevations are already warped onto their quads (correct wall content)
+    IMAGE 1 is a pre-composited dollhouse view (structural guide):
+    - Room structure, camera angle, wall positions are LOCKED
+    - Wall elevations are warped onto quads (approximate — for position reference)
     - Colored polygons on the floor mark exact furniture positions (labeled F1, F2, ...)
 
-    IMAGE 2 is the floor plan (rotated 180° for back view) showing furniture from above.
-    IMAGE 3 (optional) is the front view for style/appearance matching.
+    IMAGE 2 is the floor plan showing furniture from above.
+    IMAGE 3..N are individual wall elevation images (full-quality content references).
+    Last IMAGE is the front view for style/quality matching.
 
-    The model's ONLY job: make IMAGE 1 photorealistic and replace colored polygons with
-    real furniture at those exact positions. No spatial reasoning required.
+    The model renders photorealistic walls using the full-quality elevation content,
+    locked to the positions shown in IMAGE 1, matching the front view's quality.
     """
     cfg = _DOLLHOUSE_VIEWS[view]
     open_walls_text = " and ".join(w.upper() for w in cfg["open_walls"])
@@ -1949,59 +2007,103 @@ def build_geometric_composite_prompt(
         floor_products, openings=all_openings_flat, room_dimensions=room_dimensions,
     )
 
+    # Build elevation reference sections — tell the AI which image has which wall's content
+    elevation_sections = ""
+    if elevation_image_refs:
+        elev_lines = []
+        for compass, img_num in sorted(elevation_image_refs.items(), key=lambda x: x[1]):
+            C = compass.upper()
+            elev_lines.append(
+                f"## IMAGE {img_num} — {C} wall elevation (AUTHORITATIVE content reference)\n"
+                f"This image shows the EXACT content of the {C} wall at full quality: every painting,\n"
+                f"frame, window, door, and decoration. You MUST reproduce THIS EXACT content on the\n"
+                f"{C} wall in your render — same paintings, same frames, same positions, same colors.\n"
+                f"Do NOT substitute, simplify, or reinterpret any element. Copy the visual identity.\n"
+                f"The wall's POSITION in 3D is shown in IMAGE 1. The wall's CONTENT is in IMAGE {img_num}."
+            )
+        elevation_sections = "\n\n".join(elev_lines)
+
+    # Style reference section
     style_ref_section = ""
     if has_style_ref:
-        style_ref_section = """
-## IMAGE 3 — Front view of this SAME room (style + appearance reference)
-IMAGE 3 shows the EXACT same room from the opposite camera angle (the front view).
-Use it as your reference for:
-- How each piece of furniture looks (materials, colors, 3D shape, proportions)
-- Rendering quality, lighting style, and material appearance
-- The SAME furniture that appears in IMAGE 3 must appear here, viewed from behind
-Do NOT add any furniture not in IMAGE 3. Do NOT substitute object types.
+        snum = style_ref_image_num or "last"
+        style_ref_section = f"""
+## IMAGE {snum} — Front view of this SAME room (quality + style reference)
+IMAGE {snum} shows the EXACT same room from the opposite camera angle (the front view).
+This is your PRIMARY quality reference. Your output MUST match this level of photorealism:
+- Furniture materials, colors, 3D shapes, and proportions must be IDENTICAL
+- Lighting quality, shadow softness, and material realism must MATCH
+- The SAME furniture visible in IMAGE {snum} must appear here, viewed from behind
+- Render the walls as full 3D surfaces with realistic depth, NOT as flat textures
+Do NOT add any furniture not in IMAGE {snum}. Do NOT substitute object types.
 """
 
-    return f"""## Task — Photorealistic Polish of Pre-Composited Room
-IMAGE 1 is a PRE-COMPOSITED open-box (dollhouse) room viewed from the {standpoint} corner.
-The room's STRUCTURE IS ALREADY CORRECT and LOCKED:
-- Camera angle: fixed isometric view from {standpoint} corner
-- Wall positions and proportions: correct
-- Wall content (doors, windows, art, decor): already rendered on the walls from their elevations
-- Colored polygons on the floor: mark EXACT positions for each furniture item
+    wall_rendering_instruction = ""
+    if elevation_image_refs:
+        wall_list = ", ".join(
+            f"IMAGE {n} for {c.upper()}"
+            for c, n in sorted(elevation_image_refs.items(), key=lambda x: x[1])
+        )
+        wall_rendering_instruction = (
+            f"\n\nCRITICAL — WALL RENDERING APPROACH:\n"
+            f"IMAGE 1 shows where each wall IS (position, angle, size). The elevation images\n"
+            f"({wall_list}) show what each wall CONTAINS (paintings, windows, doors, art).\n"
+            f"You must render each wall as a photorealistic 3D surface that:\n"
+            f"  a) Occupies the EXACT position shown in IMAGE 1\n"
+            f"  b) Displays the EXACT content from its elevation image (every painting, window, door)\n"
+            f"  c) Has realistic 3D depth, perspective, lighting, and shadows — NOT a flat pasted texture\n"
+            f"  d) Matches the rendering quality of the front view reference\n"
+            f"Think of it as: you are painting the wall content FROM the elevation images ONTO the\n"
+            f"3D wall surfaces shown in IMAGE 1, with full photorealistic lighting and perspective."
+        )
 
-Your job is to produce ONE photorealistic render by:
-1. KEEP the exact wall content from IMAGE 1 — every door, window, and wall decoration stays
-   in place. The walls are ALREADY FINISHED. Do not add or remove anything from the walls.
+    return f"""## Task — Photorealistic Room Render from Structural Guide + Wall Elevations
+IMAGE 1 is a STRUCTURAL GUIDE showing an open-box (dollhouse) room from the {standpoint} corner.
+It shows the LOCKED room structure:
+- Camera angle: fixed isometric view from {standpoint} corner
+- Wall positions, angles, and proportions: CORRECT and LOCKED
+- Colored polygons on the floor: mark EXACT positions for each furniture item (labeled F1, F2, ...)
+- Wall surfaces show approximate warped textures for POSITION REFERENCE ONLY
+
+IMAGE 2 is the floor plan (rotated to match this camera view). Top=far wall, bottom=near.
+Use it to identify each piece of furniture by its shape and position from above.
+
+{elevation_sections}
+{style_ref_section}
+## Your task
+Produce ONE ultra-photorealistic render of this room by:
+1. RENDER each visible wall as a photorealistic 3D surface displaying the EXACT content from
+   its elevation image — every painting, frame, window, door, and decoration must appear with
+   the SAME visual identity (same colors, patterns, art style). Do NOT substitute or simplify.
 2. REPLACE each colored floor polygon with the corresponding photorealistic 3D furniture item.
-   The polygon's position, size, and shape define where the furniture goes — do not move it.
-   IMAGE 2 (floor plan) and IMAGE 3 (front view, if provided) show what each item looks like.
-3. ADD realistic lighting, contact shadows, and material quality to make the scene photorealistic.
+   The polygon's position, size, and shape are LOCKED — do not move furniture.
+   Use IMAGE 2 (floor plan) and the front-view reference to see what each item looks like.
+3. ADD realistic lighting, contact shadows, ambient occlusion, and material quality.
 {_style_line(presets)}
+{wall_rendering_instruction}
 
 ## Room dimensions
 {_room_desc(room_dimensions)}
 
 ## ABSOLUTE RULES — every violation is a critical error
-- Do NOT move any furniture from its colored polygon position. Positions are LOCKED.
-- Do NOT add ANY furniture or object not marked by a colored polygon on the floor.
-- Do NOT remove any furniture polygon — every single one MUST be rendered as real furniture.
-- Do NOT add, remove, or move any wall content (doors, windows, art, shelves, decorations).
-- Do NOT change the camera angle, room proportions, or wall layout.
-- The {open_walls_text} walls are removed (open toward camera) — they stay open.
-- Do NOT add text, labels, watermarks, or overlays.
+- WALL CONTENT IDENTITY: Each wall's paintings, art, and decorations must be EXACTLY as shown
+  in its elevation image. Same paintings, same frames, same visual appearance. No substitutions.
+- FURNITURE POSITIONS: Do NOT move any furniture from its colored polygon position. LOCKED.
+- NO ADDITIONS: Do NOT add ANY object not shown in the elevation images or floor polygons.
+- NO REMOVALS: Every floor polygon MUST become real furniture. Every wall element MUST appear.
+- CAMERA LOCKED: Do NOT change the camera angle, room proportions, or wall layout.
+- OPEN WALLS: The {open_walls_text} walls are removed (open toward camera) — they stay open.
+- NO OVERLAYS: Do NOT add text, labels, watermarks, or annotations.
 
 {furniture_block}
-{style_ref_section}
-## Floor plan orientation
-IMAGE 2 is the floor plan rotated 180° to match this camera view. Top=far wall, bottom=near.
-Use IMAGE 2 to see what each piece of furniture looks like from above.
 
 ## Render quality
 Ultra photorealistic, luxury interior visualization, realistic global illumination,
 ray-traced contact shadows, physically based materials (PBR), crisp details, clean result.
+Walls must look like real 3D painted surfaces with depth and lighting — NOT flat pasted images.
 
-Output: a single photorealistic dollhouse render — same structure as IMAGE 1, with colored
-polygons replaced by real 3D furniture at those exact positions.
+Output: a single photorealistic dollhouse render with the structure from IMAGE 1, wall content
+from the elevation images, and furniture replacing the colored floor polygons.
 """.strip()
 
 
@@ -2105,107 +2207,6 @@ watermarks, or overlays.
 # Two opposite cutaway views: one removes the NORTH wall, one removes the SOUTH wall. The text
 # is kept verbatim — do not reword.
 
-_ONESHOT_REMOVE_NORTH = """CRITICAL — THIS IS A CAMERA RE-RENDER, NOT A REDESIGN
-You are rendering the EXACT same room from a different camera angle. The room has a FIXED set of objects. Render ONLY what exists in the floor plan and wall images. Do NOT invent or hallucinate anything.
-
-ABSOLUTE PROHIBITIONS:
-- Do NOT add ANY furniture, chair, stool, lamp, plant, rug, shelf, or object not visible in the floor plan
-- Do NOT add art, frames, mirrors, or decorations to walls beyond what each wall image shows
-- Do NOT convert one object type into another (e.g. side tables into chairs)
-- Do NOT fill empty floor space with extra objects
-- Do NOT fill empty wall space with decor
-- Do NOT place the removed wall's windows/doors/content onto any other wall
-- A wall image that shows a bare painted surface means that wall IS bare — keep it bare
-
-Create a photorealistic architectural dollhouse visualization from the provided floor plan and four wall images.
-
-FLOOR PLAN ORIENTATION (READ THIS FIRST)
-The floor plan (Image 1) has been rotated 180° to match this back-view camera direction:
-- TOP edge    = SOUTH wall (the far BACK wall in this view)
-- BOTTOM edge = NORTH wall (the REMOVED wall nearest to camera)
-- LEFT edge   = EAST wall (left side wall in this view)
-- RIGHT edge  = WEST wall (right side wall in this view)
-Read all furniture positions and room geometry from Image 1 using this orientation.
-
-INPUT IMAGE MAPPING
-
-Image 1 = Floor plan (top-down layout, rotated 180° to match back-view camera)
-
-Image 2 = North Wall — THIS WALL IS REMOVED. Image 2 is a blank placeholder. Do NOT use it.
-
-Image 3 = South Wall
-Position: Top edge of floor plan (the BACK wall)
-
-Image 4 = East Wall
-Position: Left edge of floor plan
-
-Image 5 = West Wall
-Position: Right edge of floor plan
-
-ROOM RECONSTRUCTION RULES
-
-The floor plan is the SOLE ground-truth source of:
-- room dimensions
-- wall positions
-- furniture locations and COUNT
-- object orientations
-- spacing between products
-
-Wall images provide appearance, materials, colors, windows, doors, trims, and decorative details ONLY for their own wall. Never transfer content between walls.
-
-DOLLHOUSE CUTAWAY VIEW
-
-Camera Position:
-Outside the North Wall looking toward the South Wall.
-
-Remove the North Wall completely.
-
-Keep the South, East, and West walls fully visible and accurately textured FROM THEIR OWN IMAGES ONLY.
-
-WALL PLACEMENT IN THIS VIEW (fixed by the camera — do not swap or mirror)
-
-Because the camera stands outside the North wall facing South, each wall occupies one fixed on-screen position. The floor plan has been rotated so the BACK wall (South) is at the top and the removed wall (North) is at the bottom — read the floor plan naturally: top = far, bottom = near.
-
-- SOUTH wall (Image 3) = the BACK wall: runs left-to-right across the far side of the room. At the TOP edge of the floor plan.
-- EAST wall (Image 4) = the LEFT-side wall: recedes from the front-left toward the back-left corner. At the LEFT edge of the floor plan.
-- WEST wall (Image 5) = the RIGHT-side wall: recedes from the front-right toward the back-right corner. At the RIGHT edge of the floor plan.
-- NORTH wall = REMOVED. Do NOT draw it. Do NOT place its windows, doors, or any content on other walls.
-
-Never put one wall's contents on a different wall, and never swap the LEFT (East) and RIGHT (West) side walls.
-
-WALL FIDELITY
-
-Each wall image is the GROUND TRUTH for THAT wall ONLY. Render every wall exactly as its own image shows — do NOT generate, add, remove, change, resize, or relocate anything on a wall beyond what that wall's own image already contains. If a wall image shows a bare painted surface with no openings, the rendered wall MUST also be a bare painted surface with no openings.
-
-Camera Settings:
-- 35–45 degree viewing angle
-- slightly elevated perspective
-- wide architectural lens
-- entire room visible in one frame
-
-FURNITURE FIDELITY
-
-The camera views the room from the North side, so each item is naturally seen from its north-facing side. Show the correct visible side of each item — but the layout itself does not change:
-
-- Keep every furniture item in its EXACT floor plan location. Do not move, shift, slide, or reposition anything.
-- Do NOT rotate, spin, or re-orient furniture to face the camera. Preserve each item's true real-world orientation; only the viewing angle changes.
-- Do NOT reshape, rescale, restyle, or reconstruct any object.
-- Do NOT substitute one object type for another. A side table stays a side table — never turn it into a chair, stool, or armchair.
-- Reproduce every wall-mounted item EXACTLY as shown in its wall image — same count, same design. Never add wall items that are not in the image.
-
-RENDER STYLE
-
-- ultra photorealistic
-- luxury interior visualization
-- realistic global illumination
-- ray-traced shadows
-- physically based materials (PBR)
-- furniture catalog quality
-- crisp details
-- clean neutral background
-- high-resolution architectural render"""
-
-
 _ONESHOT_REMOVE_SOUTH = """CRITICAL — THIS IS A CAMERA RE-RENDER, NOT A REDESIGN
 You are rendering the EXACT same room from a specific camera angle. The room has a FIXED set of objects. Render ONLY what exists in the floor plan and wall images. Do NOT invent or hallucinate anything.
 
@@ -2264,9 +2265,27 @@ Because the camera stands outside the South wall facing North, each wall occupie
 
 Never put one wall's contents on a different wall, and never swap the LEFT (West) and RIGHT (East) side walls.
 
-WALL FIDELITY
+WALL FIDELITY (CRITICAL — READ CAREFULLY)
 
-Each wall image is the GROUND TRUTH for that wall. Render every wall exactly as its own image shows — do NOT generate, add, remove, change, resize, or relocate anything on a wall beyond what that wall's image already contains (this includes its art/canvas, doors, and windows).
+Each wall elevation image is the COMPLETE VISUAL AUTHORITY for that wall. You MUST reproduce EVERY element visible in each wall's image onto exactly the correct wall in the 3D view:
+
+1. WINDOWS and DOORS: Render every window and door exactly as shown in the wall's image — correct count, size, position, and style. The WALL CONTENT INVENTORY below lists the authoritative opening counts per wall.
+
+2. WALL ART and DECORATIONS: Paintings, canvases, framed prints, triptychs, mirrors, shelves, sconces, clocks — if it appears in a wall's image, it MUST appear on that wall in the output. Do NOT skip, simplify, or replace any wall-mounted item.
+
+3. WALL SURFACE: Reproduce the exact color, texture, trim, molding, and wainscoting from each wall's image.
+
+Per-wall image authority:
+- Image 2 (North wall / back wall): EVERYTHING in Image 2 goes on the back wall ONLY
+- Image 4 (East wall / right side): EVERYTHING in Image 4 goes on the right wall ONLY
+- Image 5 (West wall / left side): EVERYTHING in Image 5 goes on the left wall ONLY
+- Image 3 (South wall / REMOVED): Do NOT render this wall or transfer its content elsewhere
+
+Common failure modes to AVOID:
+- Dropping windows from side walls (check Image 4 and Image 5 for windows)
+- Omitting wall art/canvases that appear in wall images
+- Rendering a blank/plain wall when the image shows decorations
+- Transferring art or openings from one wall to another
 
 Camera Settings:
 - 35–45 degree viewing angle
@@ -2301,32 +2320,303 @@ RENDER STYLE
 - high-resolution architectural render"""
 
 
+def _build_wall_art_inventory(manifest, compass_to_image: Optional[Dict[str, int]] = None) -> str:
+    """Build a manifest-driven wall content inventory with structured wall art data.
+
+    When the manifest has wall art items with structured data (IDs, positions, sizes),
+    lists each item explicitly. Falls back to image-reference-only when no structured
+    data is available (backward compatible with the existing pixel-based approach).
+    """
+    _default_compass_to_image = {"north": 2, "south": 3, "east": 4, "west": 5}
+    c2i = compass_to_image or _default_compass_to_image
+
+    lines = [
+        "WALL CONTENT INVENTORY — per-wall rendering requirements (manifest-driven)",
+        "",
+        "CRITICAL: Each visible wall's content is listed below with unique IDs.",
+        "You MUST reproduce EVERY listed element on its assigned wall.",
+        "Do NOT transfer any element between walls. Each item stays on its own wall.",
+        "",
+    ]
+
+    checklist_items = []
+    has_any_structured = False
+
+    for compass in manifest.visible_walls:
+        C = compass.upper()
+        img_num = c2i.get(compass, "?")
+        wall_arts = manifest.wall_objects_by_wall.get(compass, [])
+        wall_opens = manifest.openings_by_wall.get(compass, [])
+
+        lines.append(f"- {C} wall (Image {img_num}):")
+
+        # Openings
+        if wall_opens:
+            for obj in wall_opens:
+                lines.append(f"  [{obj.id}] {obj.name.upper()} at {obj.x_along_wall_m:.2f}m from left, "
+                             f"{obj.width_m:.1f}m wide")
+            lines.append(f"  Openings total: {len(wall_opens)}")
+        else:
+            lines.append("  Openings: NONE — this wall has no windows or doors. Do NOT add any.")
+
+        # Wall art items
+        if wall_arts:
+            has_any_structured = True
+            for obj in wall_arts:
+                x_str = f"{obj.x_along_wall_m:.2f}m from left" if obj.x_along_wall_m is not None else "see image"
+                y_str = f"{obj.y_from_floor_m:.2f}m above floor" if obj.y_from_floor_m is not None else ""
+                size_str = f"{obj.width_m:.1f}\u00d7{obj.height_m:.1f}m" if obj.width_m and obj.height_m else ""
+                parts = [p for p in [x_str, y_str, size_str] if p]
+                lines.append(f"  [{obj.id}] '{obj.name}' at {', '.join(parts)}")
+            lines.append(f"  Wall-mounted items total: {len(wall_arts)}")
+        else:
+            lines.append(f"  Wall-mounted items: See Image {img_num} for visual content")
+
+        lines.append("")
+
+        # Checklist
+        art_count = len(wall_arts)
+        open_count = len(wall_opens)
+        checklist_items.append(
+            f"  [ ] {C} wall (Image {img_num}): {open_count} opening(s), "
+            f"{art_count} wall art item(s) — all reproduced on correct wall?"
+        )
+
+    # Removed wall
+    R = manifest.removed_wall.upper()
+    lines.append(
+        f"- {R} wall: REMOVED (open side toward camera). Do NOT draw this wall. "
+        f"Do NOT place its content on any other wall."
+    )
+
+    lines.append("")
+    lines.append("WALL CONTENT CHECKLIST — verify EACH wall before finalizing:")
+    for item in checklist_items:
+        lines.append(item)
+    lines.append(
+        "If ANY wall is missing art, frames, windows, or doors, you have failed."
+    )
+
+    return "\n".join(lines)
+
+
+def _build_furniture_placement_block_from_manifest(manifest, room_dimensions: Optional[Dict] = None) -> str:
+    """Build floor object inventory from a ViewManifest, using SceneObject IDs."""
+    if not manifest.floor_objects:
+        return ""
+
+    n = len(manifest.floor_objects)
+    rd = room_dimensions or {}
+    room_w = manifest.room_width_m or float(rd.get("width") or 0)
+    room_d = manifest.room_depth_m or float(rd.get("depth") or rd.get("height") or rd.get("length") or 0)
+
+    lines = [
+        f"MANDATORY FLOOR OBJECT INVENTORY — exactly {n} object(s), NO MORE, NO FEWER",
+        f"The room floor contains EXACTLY {n} object(s) listed below. "
+        f"You MUST render ALL {n} of them — missing even one item is a critical failure. "
+        f"If an object is NOT in this list, it MUST NOT appear in the render. "
+        f"Do NOT add extra chairs, stools, lamps, plants, shelves, or accessories.",
+        "Each item below MUST appear in the output at the stated (x, y) metre coordinate with "
+        "the stated facing direction. Preserve EXACTLY — do not move, rotate, resize, or restyle.",
+    ]
+
+    if room_d > 0:
+        lines.append(
+            "\nDEPTH ZONES (camera is outside the south/bottom edge, looking north/up):\n"
+            "- FOREGROUND = near the camera/open side (bottom of floor plan).\n"
+            "- BACKGROUND = against the far back wall (top of floor plan).\n"
+            "- MIDGROUND = in the middle of the room.\n"
+            "CRITICAL: Do NOT relocate items between depth zones."
+        )
+
+    _FACING_MAP = {0: "NORTH", 90: "EAST", 180: "SOUTH", 270: "WEST"}
+    _FACING_CAMERA_REL = {
+        0: "NORTH (toward the BACK wall)",
+        90: "EAST (toward the RIGHT wall)",
+        180: "SOUTH (toward the camera/open side)",
+        270: "WEST (toward the LEFT wall)",
+    }
+    item_names = []
+
+    for obj in manifest.floor_objects:
+        dim_str = f" ({obj.width_m:.1f}\u00d7{obj.depth_m:.1f}m)" if obj.width_m and obj.depth_m else ""
+        facing = _FACING_MAP.get(obj.rotation, f"{obj.rotation}\u00b0")
+        facing_rel = _FACING_CAMERA_REL.get(obj.rotation, facing)
+
+        depth_tag = ""
+        if room_d > 0 and obj.y_m is not None:
+            depth_frac = obj.y_m / room_d
+            if depth_frac > 0.70:
+                depth_tag = " [FOREGROUND]"
+            elif depth_frac < 0.30:
+                depth_tag = " [BACKGROUND]"
+            else:
+                depth_tag = " [MIDGROUND]"
+
+        small_warning = ""
+        if room_w > 0 and room_d > 0 and obj.width_m > 0 and obj.depth_m > 0:
+            w_pct = obj.width_m / room_w * 100
+            d_pct = obj.depth_m / room_d * 100
+            if max(w_pct, d_pct) < 15:
+                small_warning = f" *** SMALL ITEM — DO NOT OMIT ***"
+
+        x_val = obj.x_m if obj.x_m is not None else 0
+        y_val = obj.y_m if obj.y_m is not None else 0
+        lines.append(
+            f"- [{obj.id}] {obj.name}{dim_str} at ({x_val:.1f}, {y_val:.1f})m, "
+            f"front faces {facing_rel}{depth_tag}{small_warning}"
+        )
+        item_names.append(f"[{obj.id}] {obj.name}")
+
+        # Per-item companion warning for desk/table categories
+        obj_name_lower = obj.name.lower()
+        if "desk" in obj_name_lower or "table" in obj_name_lower:
+            lines.append(
+                f"    ^ NO CHAIR with this {obj.name} — render the {obj.name} ALONE"
+            )
+
+    lines.append(f"\nTotal: {n} floor object(s). Any object not listed above is HALLUCINATED.")
+    lines.append(f"\nMANDATORY RENDERING CHECKLIST — your output MUST contain ALL {n} items:")
+    for item_name in item_names:
+        lines.append(f"  [ ] {item_name}")
+    lines.append(
+        f"Verify your output: count the distinct furniture items — there must be exactly {n}."
+    )
+
+    # Final count enforcement block (exploits recency bias — placed last)
+    lines.append(
+        f"\nFINAL COUNT: You MUST render EXACTLY {n} floor items.\n"
+        f"Count them in your output before finishing. If you count more than {n}, "
+        f"you have hallucinated an object — remove it."
+    )
+
+    return "\n".join(lines)
+
+
+def _build_manifest_summary(manifest) -> str:
+    """Build a concise summary block showing total visible object counts."""
+    total = manifest.total_floor_count + manifest.total_wall_art_count + manifest.total_openings_count
+
+    floor_ids = ", ".join(obj.id for obj in manifest.floor_objects) if manifest.floor_objects else "none"
+    wall_ids = ", ".join(
+        obj.id
+        for objs in manifest.wall_objects_by_wall.values()
+        for obj in objs
+    ) if manifest.total_wall_art_count > 0 else "none"
+    opening_ids = ", ".join(
+        obj.id
+        for objs in manifest.openings_by_wall.values()
+        for obj in objs
+    ) if manifest.total_openings_count > 0 else "none"
+
+    lines = [
+        "COMPLETE ROOM MANIFEST",
+        f"Total visible objects: {total}",
+        f"  Floor furniture: {manifest.total_floor_count} ({floor_ids})",
+        f"  Wall-mounted items: {manifest.total_wall_art_count} ({wall_ids})",
+        f"  Openings: {manifest.total_openings_count} ({opening_ids})",
+        "",
+        "Per-wall summary:",
+    ]
+    for c in manifest.visible_walls:
+        lines.append(f"  {manifest.wall_summaries.get(c, c.upper() + ' wall')}")
+
+    return "\n".join(lines)
+
+
+def _build_anti_hallucination_section(manifest) -> str:
+    """Build strict anti-hallucination rules referencing manifest counts and IDs."""
+    total = manifest.total_floor_count + manifest.total_wall_art_count + manifest.total_openings_count
+
+    lines = [
+        "ANTI-HALLUCINATION RULES",
+        f"1. OBJECT COUNT: This room contains EXACTLY {total} visible objects. "
+        f"If your output has more or fewer, it is WRONG.",
+        f"2. NO COMPANION FURNITURE: The model frequently hallucinates these — REJECT the urge:\n"
+        f"   - Desk → Do NOT add an office chair, stool, or task chair\n"
+        f"   - Table → Do NOT add chairs around it unless listed\n"
+        f"   - Bed → Do NOT add nightstands unless listed\n"
+        f"   - Sofa → Do NOT add side tables or floor lamps unless listed\n"
+        f"   If the item is NOT in the inventory above, it MUST NOT exist.",
+        f"3. NO WALL MIGRATION: Each item stays on its assigned wall. "
+        f"Wall art stays on its wall — never moved to another wall or the floor.",
+        f"4. NO TYPE SUBSTITUTION: A side table stays a side table. "
+        f"Never convert one object into another.",
+        f"5. EMPTY = EMPTY: If a floor area is empty in the floor plan, leave it empty. "
+        f"If a wall has 0 art items, render it bare.",
+    ]
+
+    if manifest.must_not_appear:
+        lines.append(
+            f"6. MUST NOT APPEAR (on removed {manifest.removed_wall.upper()} wall): "
+            f"{', '.join(manifest.must_not_appear)}. These belong to the removed wall."
+        )
+
+    return "\n".join(lines)
+
+
+def build_prompt_from_manifest(manifest, base_template: str, room_dimensions: Optional[Dict] = None) -> str:
+    """Build a complete prompt from a ViewManifest, replacing the fragmented approach.
+
+    Assembles: base_template + wall_art_inventory + floor_inventory +
+    manifest_summary + anti_hallucination.
+    """
+    extra_blocks: List[str] = []
+
+    # Wall content inventory with structured wall art data
+    wall_inv = _build_wall_art_inventory(manifest)
+    if wall_inv:
+        extra_blocks.append(wall_inv)
+
+    # Floor object inventory with IDs
+    furniture_block = _build_furniture_placement_block_from_manifest(manifest, room_dimensions)
+    if furniture_block:
+        extra_blocks.append(furniture_block)
+
+    # Manifest summary — total counts
+    summary = _build_manifest_summary(manifest)
+    extra_blocks.append(summary)
+
+    # Anti-hallucination section
+    anti_hall = _build_anti_hallucination_section(manifest)
+    extra_blocks.append(anti_hall)
+
+    if extra_blocks:
+        return base_template + "\n\n" + "\n\n".join(extra_blocks)
+    return base_template
+
+
 def build_dollhouse_oneshot_prompt(
     removed_wall: str,
     floor_products: Optional[List[Dict]] = None,
     openings_by_wall: Optional[Dict[str, List[Dict]]] = None,
     room_dimensions: Optional[Dict] = None,
+    view_manifest=None,
 ) -> str:
-    """Return the single-shot dollhouse prompt for the cutaway that removes
-    `removed_wall` ("north" or "south"). Images must be sent in the fixed order
+    """Return the single-shot dollhouse prompt for the front cutaway view
+    (removes south wall). Images must be sent in the fixed order
     [floor, north, south, east, west] so the Image→compass mapping in the text holds.
 
-    If floor_products is provided, appends an authoritative object inventory so the
-    model has explicit position/rotation data and a hard object count instead of
-    guessing from pixels.  openings_by_wall adds per-wall content descriptions that
-    prevent the model from hallucinating windows/doors on solid walls.
-    """
-    is_back = removed_wall.lower() == "north"
-    base = _ONESHOT_REMOVE_SOUTH if not is_back else _ONESHOT_REMOVE_NORTH
+    If view_manifest is provided, uses the manifest-driven prompt builder for
+    structured wall art, floor inventory with IDs, manifest summary, and
+    anti-hallucination rules. Otherwise falls back to the existing approach.
 
+    If floor_products is provided (without manifest), appends an authoritative
+    object inventory so the model has explicit position/rotation data and a hard
+    object count instead of guessing from pixels.
+    """
+    base = _ONESHOT_REMOVE_SOUTH
+
+    # Manifest-driven path: structured IDs, counts, anti-hallucination
+    if view_manifest is not None:
+        return build_prompt_from_manifest(view_manifest, base, room_dimensions)
+
+    # Legacy path: fragmented wall inventory + furniture block
     extra_blocks: List[str] = []
 
     # Wall content inventory — tells the model exactly which walls have openings
     # and which are solid, preventing window/door hallucination.
-    if is_back:
-        visible = ["south", "east", "west"]
-    else:
-        visible = ["north", "east", "west"]
+    visible = ["north", "east", "west"]
     wall_inv = _build_wall_content_inventory(openings_by_wall, visible, removed_wall)
     if wall_inv:
         extra_blocks.append(wall_inv)
@@ -2334,7 +2624,7 @@ def build_dollhouse_oneshot_prompt(
     # Floor object inventory — hard count + positions + size context.
     all_openings_flat = [o for ops in (openings_by_wall or {}).values() for o in ops]
     furniture_block = _build_furniture_placement_block(
-        floor_products, openings=all_openings_flat, rotated_180=is_back,
+        floor_products, openings=all_openings_flat, rotated_180=False,
         room_dimensions=room_dimensions,
     )
     if furniture_block:

@@ -405,6 +405,7 @@ def _run_composition(gen_id: str, payload: dict):
             openings=payload.get("openings") or [],
             base_dir=str(BASE_DIR),
             floor_products=payload.get("floor_products"),
+            wall_products=payload.get("wall_products"),
         )
         paths: dict = {}
         for corner_name, img_bytes in results.items():
