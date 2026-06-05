@@ -16,6 +16,7 @@ from prompt import (
     build_floor_plan_prompt, build_wall_plan_prompt,
     build_dollhouse_shell_prompt, build_dollhouse_add_wall_prompt,
     build_geometric_furnish_prompt, build_dollhouse_oneshot_prompt,
+    build_camera_view_config,
     dollhouse_view_walls,
 )
 import geometry as geo_mod
@@ -1695,24 +1696,17 @@ def generate_room_composition(
         )
         return best_bytes
 
-    # Image slot order per view so both prompts share the same slot meaning:
-    #   slot 2 = back wall, slot 3 = removed wall, slot 4 = right wall, slot 5 = left wall
-    # Front (remove south): back=N, removed=S, right=E, left=W  → [N, S, E, W]
-    # Back  (remove north): back=S, removed=N, right=W, left=E  → [S, N, W, E]
-    _VIEW_IMAGE_ORDER = {
-        "south": ("north", "south", "east", "west"),
-        "north": ("south", "north", "west", "east"),
-    }
-
     def _ordered_wall_images(removed_wall: str) -> tuple:
         # Returns (images, blank_compass).
+        # Uses CameraViewConfig as the single source of truth for image slot order.
         # Removed wall always gets a blank placeholder — sending its elevation lets
         # the model migrate that content to a blank visible-wall slot.
+        cfg = build_camera_view_config(removed_wall)
         wall_color = (presets or {}).get("wall_color", "#F3EFE8")
         placeholder: Optional[bytes] = None
         out: List[bytes] = []
         blank_compass: List[str] = []
-        for c in _VIEW_IMAGE_ORDER.get(removed_wall, ("north", "south", "east", "west")):
+        for c in cfg.image_order:
             b = wall_map.get(c)
             if b is None or c == removed_wall:
                 if placeholder is None:
@@ -1738,8 +1732,10 @@ def generate_room_composition(
         logger.info("Composition backend: ONESHOT (floor + four walls in a single call per view)")
         # "front" removes the SOUTH wall (camera outside south, North is the focal back wall);
         # "back" removes the NORTH wall (camera outside north). Together they reveal all walls.
-        front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_oneshot("south", floor_bytes), ["north", "east", "west"])
-        back_fn  = lambda: _run_qa_loop("back",  lambda n: _assemble_oneshot("north", floor_bytes_back), ["south", "east", "west"])
+        front_cfg = build_camera_view_config("south")
+        back_cfg = build_camera_view_config("north")
+        front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_oneshot("south", floor_bytes), front_cfg.visible_walls)
+        back_fn  = lambda: _run_qa_loop("back",  lambda n: _assemble_oneshot("north", floor_bytes_back), back_cfg.visible_walls)
     elif COMPOSITION_BACKEND == "geometric":
         logger.info("Composition backend: GEOMETRIC (computed structure guide + guided photoreal fill)")
         front_designed = [c for c in dollhouse_view_walls("front")[1] if c in wall_map]

@@ -1,4 +1,6 @@
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel
 
 
@@ -67,3 +69,44 @@ class FloorPlanRequest(BaseModel):
     lighting: Optional[Dict[str, Any]] = None
     camera_views: Optional[List[Dict[str, Any]]] = []
     size: str = "1024x1024"       # "1024x1024" | "1536x1024" | "1024x1536"
+
+
+# ── Camera-wall manifest (single source of truth for composite views) ─────
+
+@dataclass(frozen=True)
+class WallSlot:
+    """One wall's role within a specific camera view."""
+    compass: str      # "north", "south", "east", "west"
+    role: str          # "back", "removed", "right", "left"
+    image_slot: int    # 2=back, 3=removed, 4=right, 5=left
+    description: str   # e.g. "runs left-to-right across the far side of the room"
+
+
+@dataclass(frozen=True)
+class CameraViewConfig:
+    """Computed manifest mapping compass walls to camera-relative roles for a
+    specific camera position.  Built once per view, consumed by prompt
+    construction, image ordering, and validation."""
+    camera_wall: str
+    back: WallSlot
+    removed: WallSlot
+    right: WallSlot
+    left: WallSlot
+    visible_walls: List[str]   # [back.compass, right.compass, left.compass]
+
+    @property
+    def image_order(self) -> tuple:
+        """Compass order in which wall images are sent to the model:
+        slot 2=back, slot 3=removed, slot 4=right, slot 5=left."""
+        return (self.back.compass, self.removed.compass,
+                self.right.compass, self.left.compass)
+
+    def slot_for_compass(self, compass: str) -> Optional[WallSlot]:
+        for ws in (self.back, self.removed, self.right, self.left):
+            if ws.compass == compass:
+                return ws
+        return None
+
+    def role_for_compass(self, compass: str) -> Optional[str]:
+        ws = self.slot_for_compass(compass)
+        return ws.role if ws else None

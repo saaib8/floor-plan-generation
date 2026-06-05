@@ -14,6 +14,8 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
+from models import CameraViewConfig
+
 logger = logging.getLogger(__name__)
 
 # ── Configuration via environment variables ──────────────────────────────────
@@ -599,6 +601,10 @@ def _describe_wall_openings_for_qa(compass: str, ops: Optional[List[Dict]]) -> s
     return f"  - {C} wall: MUST have exactly {spec} — no more, no fewer, none relocated."
 
 
+# Map view name → camera wall for building a CameraViewConfig
+_VIEW_TO_CAMERA_WALL = {"front": "south", "back": "north"}
+
+
 def _build_composition_validation_prompt(
     designed_walls: List[str],
     visible_walls: List[str],
@@ -613,16 +619,23 @@ def _build_composition_validation_prompt(
       IMAGE 3.. = each DESIGNED wall elevation, in `designed_walls` order
     `openings_by_wall` is the AUTHORITATIVE per-wall opening spec for ALL visible walls.
     """
+    from prompt import build_camera_view_config
+
     ob = openings_by_wall or {}
+
+    # Build camera config for role annotations
+    camera_wall = _VIEW_TO_CAMERA_WALL.get(view, "south")
+    cfg = build_camera_view_config(camera_wall)
 
     wall_lines = []
     for i, compass in enumerate(designed_walls):
+        role = cfg.role_for_compass(compass) or "visible"
         wall_lines.append(
-            f"  - IMAGE {i + 3} = the {compass.upper()} wall elevation. In the composite, the "
-            f"{compass.upper()} wall MUST show exactly these wall-mounted items (same TYPES — a "
-            f"framed picture/art stays a picture, never a window; never swapped), the same count, "
-            f"the same heights, and the SAME LEFT-TO-RIGHT ORDER as the elevation — NOT mirrored "
-            f"or flipped."
+            f"  - IMAGE {i + 3} = the {compass.upper()} wall (the {role.upper()} wall in this view). "
+            f"In the composite, the {compass.upper()} wall MUST show exactly these wall-mounted items "
+            f"(same TYPES — a framed picture/art stays a picture, never a window; never swapped), "
+            f"the same count, the same heights, and the SAME LEFT-TO-RIGHT ORDER as the elevation "
+            f"— NOT mirrored or flipped."
         )
     walls_block = "\n".join(wall_lines) if wall_lines else "  (No designed walls with elevations in this view.)"
 
@@ -632,12 +645,24 @@ def _build_composition_validation_prompt(
 
     wall_ids = ", ".join(w.upper() for w in visible_walls) or "(none)"
 
+    # Build WALL POSITIONS block telling the validator which compass wall is where
+    wall_positions_lines = [
+        f"  - {cfg.back.compass.upper()} wall = BACK wall ({cfg.back.description})",
+        f"  - {cfg.right.compass.upper()} wall = RIGHT wall ({cfg.right.description})",
+        f"  - {cfg.left.compass.upper()} wall = LEFT wall ({cfg.left.description})",
+        f"  - {cfg.removed.compass.upper()} wall = REMOVED (should NOT be visible — the near side is open)",
+    ]
+    wall_positions_block = "\n".join(wall_positions_lines)
+
     return f"""You are a strict QA inspector for an interior-design composite render.
 
 You are given several images:
 - IMAGE 1 = a generated open-box "dollhouse" render of a room (the {view.upper()} view) — THIS is what you judge.
 - IMAGE 2 = the floor render: the ground truth for floor furniture (identity, count, positions).
 {walls_block}
+
+## WALL POSITIONS in this camera view
+{wall_positions_block}
 
 ## AUTHORITATIVE openings (the single source of truth — trust this over any image)
 For EACH visible wall, the composite must show exactly these openings and nothing else:
@@ -660,21 +685,27 @@ Judge whether IMAGE 1 faithfully ASSEMBLES the sources. Check, per visible wall 
    of the door in IMAGE 1 (and likewise for left). If the wall's contents are mirrored / flipped
    (order reversed, or an item that was on the right of an opening is now on its left), that wall
    is a FAILURE — set its "left_right_correct" to false. This is a common, important defect.
+5. WALL IDENTITY: verify each wall appears in the correct camera-relative position (BACK, RIGHT,
+   LEFT) as described in WALL POSITIONS above. If a wall's content appears on the wrong side of the
+   room (e.g. the BACK wall's art is on a side wall), set "correct_position" to false.
 
 Also check globally:
 - MIGRATION: no item from one wall appears on a different wall, the floor, or the ceiling.
 - FLOOR: the furniture from IMAGE 2 is present, with the same count and roughly the same layout.
 - INVENTED/EXTRA: nothing was invented that is absent from all the sources / the authoritative list.
+- REMOVED WALL: the {cfg.removed.compass.upper()} wall (the removed/open side) should NOT be visible.
+  If it appears as a solid wall in IMAGE 1, set "removed_wall_visible" to true.
 
 Respond with ONLY valid JSON in this exact format:
 {{
   "walls": [
-    {{"wall": "north", "content_matches": true, "openings_correct": true, "left_right_correct": true, "notes": "..."}}
+    {{"wall": "north", "role": "back", "content_matches": true, "openings_correct": true, "left_right_correct": true, "correct_position": true, "notes": "..."}}
   ],
   "migrated_items": 0,
   "missing_items": 0,
   "extra_items": 0,
   "floor_furniture_correct": true,
+  "removed_wall_visible": false,
   "overall_notes": "brief summary of the most important problems, if any"
 }}"""
 
@@ -695,18 +726,22 @@ def _parse_composition_validation_response(raw_text: str) -> ValidationResult:
     walls_ok = True
     openings_ok = True
     mirrored_walls = 0
+    mispositioned_walls = 0
     for w in data.get("walls", []):
         content_ok = bool(w.get("content_matches", True))
         opening_ok = bool(w.get("openings_correct", True))
         lr_ok = bool(w.get("left_right_correct", True))
+        pos_ok = bool(w.get("correct_position", True))
         if not lr_ok:
             mirrored_walls += 1
-        walls_ok = walls_ok and content_ok and lr_ok
+        if not pos_ok:
+            mispositioned_walls += 1
+        walls_ok = walls_ok and content_ok and lr_ok and pos_ok
         openings_ok = openings_ok and opening_ok
         product_checks.append(ProductValidation(
             product_id=str(w.get("wall", "?")),
             # A mirrored wall is a position failure (items are on the wrong side).
-            position_correct=content_ok and lr_ok,
+            position_correct=content_ok and lr_ok and pos_ok,
             size_correct=content_ok,
             rotation_correct=lr_ok,
             notes=w.get("notes", ""),
@@ -716,15 +751,18 @@ def _parse_composition_validation_response(raw_text: str) -> ValidationResult:
     missing = int(data.get("missing_items", 0))
     extra = int(data.get("extra_items", 0))
     floor_ok = bool(data.get("floor_furniture_correct", True))
+    removed_wall_visible = bool(data.get("removed_wall_visible", False))
 
     # Score: migrations and missing items are the worst failures (they're exactly
     # the dislocation/drop problems we are trying to eliminate). A mirrored/flipped
     # wall is penalised heavily too, so best-of-N selection rejects flipped candidates.
+    # Wall in wrong camera-relative position and removed wall visible are new penalties.
     score = 1.0
     for pc in product_checks:
         if not pc.size_correct:           # content/type mismatch
             score -= 0.20
     score -= mirrored_walls * 0.30
+    score -= mispositioned_walls * 0.25  # wall in wrong camera-relative position
     score -= migrated * 0.25
     score -= missing * 0.20
     score -= extra * 0.10
@@ -732,6 +770,8 @@ def _parse_composition_validation_response(raw_text: str) -> ValidationResult:
         score -= 0.15
     if not floor_ok:
         score -= 0.15
+    if removed_wall_visible:
+        score -= 0.20
     score = max(0.0, min(1.0, score))
 
     return ValidationResult(

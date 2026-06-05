@@ -2,6 +2,41 @@ import json
 import re
 from typing import Dict, List, Optional
 
+from models import CameraViewConfig, WallSlot
+
+# ── Camera-wall manifest factory ──────────────────────────────────────────
+
+_COMPASS_CW = ["north", "east", "south", "west"]
+
+_WALL_DESCRIPTIONS = {
+    "back": "runs left-to-right across the far side of the room",
+    "removed": "the removed/open side nearest the camera",
+    "right": "recedes from the front-right toward the back-right corner",
+    "left": "recedes from the front-left toward the back-left corner",
+}
+
+
+def build_camera_view_config(camera_wall: str) -> CameraViewConfig:
+    """Build a CameraViewConfig for a camera standing outside `camera_wall` looking in.
+
+    Uses a clockwise compass ring to compute:
+    - back   = opposite wall (idx+2)
+    - right  = idx-1 (standing outside, looking in, your right hand)
+    - left   = idx+1
+    """
+    idx = _COMPASS_CW.index(camera_wall.lower())
+    back_c = _COMPASS_CW[(idx + 2) % 4]
+    right_c = _COMPASS_CW[(idx - 1) % 4]
+    left_c = _COMPASS_CW[(idx + 1) % 4]
+    return CameraViewConfig(
+        camera_wall=camera_wall.lower(),
+        back=WallSlot(back_c, "back", 2, _WALL_DESCRIPTIONS["back"]),
+        removed=WallSlot(camera_wall.lower(), "removed", 3, _WALL_DESCRIPTIONS["removed"]),
+        right=WallSlot(right_c, "right", 4, _WALL_DESCRIPTIONS["right"]),
+        left=WallSlot(left_c, "left", 5, _WALL_DESCRIPTIONS["left"]),
+        visible_walls=[back_c, right_c, left_c],
+    )
+
 
 def _parse_room_wh(room_dimensions: Dict) -> tuple:
     rd = room_dimensions or {}
@@ -1757,137 +1792,39 @@ watermarks, or overlays.
 
 
 # ── Single-shot dollhouse prompts ────────────────────────────────────────────
-# Images always arrive in fixed compass order:
-#   Image 1 = floor render, Image 2 = NORTH, Image 3 = SOUTH,
-#   Image 4 = EAST, Image 5 = WEST.
-# Two separate prompts map each compass wall to its on-screen position for
-# that specific camera angle.
-
-_ONESHOT_REMOVE_SOUTH = """Create a photorealistic architectural dollhouse visualization from the provided isometric room render and four wall images.
-
-INPUT IMAGE MAPPING
-
-Image 1 = Top-down isometric layout of the room — authoritative source for room geometry, furniture positions, footprints, spacing, and in-plan facing. It is NOT the final camera; the final three-quarter dollhouse camera is described below.
-
-Image 2 = North Wall
-Position: Far/back side of room
-
-Image 3 = South Wall
-Position: Near side — this wall is REMOVED (camera stands outside it)
-
-Image 4 = East Wall
-Position: Right edge of room
-
-Image 5 = West Wall
-Position: Left edge of room
-
-ROOM RECONSTRUCTION RULES
-
-North Wall = Image 2
-South Wall = Image 3
-East Wall  = Image 4
-West Wall  = Image 5
-
-Image 1 (isometric render) is the ground-truth source of:
-- room dimensions
-- wall positions
-- furniture locations
-- object orientations
-- spacing between products
-
-Wall images provide appearance, materials, colors, windows, doors, trims, and decorative details only.
-
-Do not:
-- swap wall locations
-- mirror walls
-- rotate walls
-- alter room proportions
-- move furniture
-- add products
-- remove products
-
-DOLLHOUSE CUTAWAY VIEW
-
-Camera Position:
-Outside the South Wall looking toward the North Wall.
-
-Remove the South Wall completely.
-
-Keep the North, East, and West walls fully visible and accurately textured.
-
-WALL PLACEMENT IN THIS VIEW (fixed by the camera — do not swap or mirror)
-
-Because the camera stands outside the South wall facing North, each wall occupies one fixed on-screen position. Render each wall's appearance from its own image onto exactly the position below:
-- NORTH wall (Image 2) = the BACK wall: runs left-to-right across the far side of the room.
-- EAST wall  (Image 4) = the RIGHT-side wall: recedes from the front-right toward the back-right corner.
-- WEST wall  (Image 5) = the LEFT-side wall: recedes from the front-left toward the back-left corner.
-- SOUTH wall (Image 3) = the removed/open side nearest the camera: do NOT draw it, and do NOT place its contents on any other wall.
-
-Never put one wall's contents on a different wall, and never swap the LEFT (West) and RIGHT (East) side walls.
-
-WALL FIDELITY
-
-Each wall image is the GROUND TRUTH for that wall. Render every wall exactly as its own image shows — do NOT generate, add, remove, change, resize, or relocate anything on a wall beyond what that wall's image already contains (this includes its art/canvas, doors, and windows).
-
-Camera settings:
-- 35–45 degree viewing angle
-- slightly elevated perspective
-- wide architectural lens
-- entire room visible in one frame
-
-FURNITURE & WALL-ART FIDELITY
-
-This render's camera looks into the room from the open South side (the three-quarter dollhouse view described above), so each item is seen from that angle. Use Image 1 only for layout — it is top-down — and keep that layout exactly:
-
-- Keep every furniture item in its EXACT location as shown in Image 1. Do not move, shift, slide, or reposition anything.
-- Do NOT rotate, spin, or re-orient furniture to face the camera. Preserve each item's true real-world orientation; only the viewing angle changes.
-- Do NOT reshape, rescale, restyle, or reconstruct any object.
-- Reproduce every wall-mounted item (framed art, canvas, mirror, shelf, sconce) EXACTLY as shown in its wall image — same artwork, same type, same count, same colors, same design. Never repaint, alter, or swap a canvas/artwork, and never turn it into a window or any other object.
-
-PLACEMENT & VISIBILITY REQUIREMENTS
-
-Preserve exact furniture placement and scale from Image 1. No furniture may be relocated, resized, or duplicated.
-Render each item only as it is genuinely seen from this angle: an item may be partially or fully occluded by OTHER FURNITURE in front of it — that is natural and correct. Do NOT move, shrink, duplicate, or re-arrange items to force every piece into view.
-No furniture may be hidden behind a WALL — the near wall is open/removed in the dollhouse view, so nothing should be blocked by a wall.
-Keep the whole room and its overall layout in frame; do not crop away large parts of the room.
-
-RENDER STYLE
-
-- ultra photorealistic
-- luxury interior visualization
-- realistic global illumination
-- ray-traced shadows
-- physically based materials (PBR)
-- furniture catalog quality
-- crisp details
-- clean neutral background
-- high-resolution architectural render"""
+# A single generic template driven by a CameraViewConfig replaces the old
+# per-view hardcoded prompts.  The config is the single source of truth for
+# which compass wall is back/right/left/removed and what image slot it uses.
 
 
-_ONESHOT_REMOVE_NORTH = """Create a photorealistic architectural dollhouse visualization from the provided isometric room render and four wall images.
+def _build_oneshot_template(cfg: CameraViewConfig) -> str:
+    """Build a generic dollhouse cutaway prompt from a CameraViewConfig.
+
+    Uses Image-1-anchored language throughout so the model maps walls by
+    their on-screen position relative to the floor render, not by compass.
+    """
+    B = cfg.back
+    R = cfg.right
+    L = cfg.left
+    REM = cfg.removed
+
+    return f"""Create a photorealistic architectural dollhouse visualization from the provided isometric room render and four wall images.
 
 INPUT IMAGE MAPPING
 
 Image 1 = Top-down isometric layout of the room — authoritative source for room geometry, furniture positions, footprints, spacing, and in-plan facing. It is NOT the final camera; the final three-quarter dollhouse camera is described below.
 
-Image 2 = South Wall
-Position: Far/back side of room
-
-Image 3 = North Wall
-Position: Near side — this wall is REMOVED (camera stands outside it)
-
-Image 4 = West Wall
-Position: Right edge of room
-
-Image 5 = East Wall
-Position: Left edge of room
+Image {B.image_slot} = {B.compass.title()} Wall / Position: BACK wall — {B.description}
+Image {REM.image_slot} = {REM.compass.title()} Wall / Position: REMOVED (camera stands outside it)
+Image {R.image_slot} = {R.compass.title()} Wall / Position: RIGHT wall — {R.description}
+Image {L.image_slot} = {L.compass.title()} Wall / Position: LEFT wall — {L.description}
 
 ROOM RECONSTRUCTION RULES
 
-South Wall = Image 2
-North Wall = Image 3
-West Wall  = Image 4
-East Wall  = Image 5
+{B.compass.title()} Wall = Image {B.image_slot}
+{REM.compass.title()} Wall = Image {REM.image_slot}
+{R.compass.title()} Wall = Image {R.image_slot}
+{L.compass.title()} Wall = Image {L.image_slot}
 
 Image 1 (isometric render) is the ground-truth source of:
 - room dimensions
@@ -1913,18 +1850,25 @@ Camera:
 Build the three-quarter dollhouse view (see Camera settings below) from Image 1's layout. Keep the SAME orientation as Image 1 — do NOT orbit, rotate, flip, or mirror relative to it, and do NOT re-arrange its furniture: the wall at the BACK of Image 1 stays the back wall, the LEFT side stays the left wall, the RIGHT side stays the right wall, and the NEAR/front side is the open (removed) side.
 
 Cutaway:
-Remove the near/open wall at the FRONT of Image 1 (its elevation is Image 3) — do NOT draw it, and do NOT place its contents on any other wall.
+Remove the near/open wall at the FRONT of Image 1 (its elevation is Image {REM.image_slot}) — do NOT draw it, and do NOT place its contents on any other wall.
 Keep the far/back wall and both side walls fully visible and accurately textured.
 
 WALL PLACEMENT IN THIS VIEW (fixed by Image 1's geometry — do not swap or mirror)
 
 Each wall occupies one fixed on-screen position, matching Image 1's geometry exactly. Render each wall's appearance from its own image onto exactly the position below:
-- BACK wall (far side, runs left-to-right across the back of the room) = Image 2 (South Wall).
-- RIGHT-side wall (recedes from the front-right toward the back-right corner) = Image 4 (West Wall).
-- LEFT-side wall (recedes from the front-left toward the back-left corner) = Image 5 (East Wall).
-- NEAR/open wall (the removed front side) = Image 3 (North Wall): do NOT draw it, and do NOT place its contents on any other wall.
+- BACK wall ({B.description}) = Image {B.image_slot} ({B.compass.title()} Wall).
+- RIGHT-side wall ({R.description}) = Image {R.image_slot} ({R.compass.title()} Wall).
+- LEFT-side wall ({L.description}) = Image {L.image_slot} ({L.compass.title()} Wall).
+- NEAR/open wall ({REM.description}) = Image {REM.image_slot} ({REM.compass.title()} Wall): do NOT draw it, and do NOT place its contents on any other wall.
 
-Never put one wall's contents on a different wall, and never swap the LEFT and RIGHT side walls.
+Never put one wall's contents on a different wall, and never swap the LEFT ({L.compass.title()}) and RIGHT ({R.compass.title()}) side walls.
+
+REMOVED WALL PLACEHOLDER
+
+Image {REM.image_slot} ({REM.compass.title()} Wall) is a placeholder for the REMOVED near wall.
+It is included only to maintain the fixed image numbering.
+Do NOT render this wall. Do NOT infer decorations from this blank image.
+Do NOT copy any objects onto it. The near side of the room is OPEN.
 
 WALL FIDELITY
 
@@ -1969,20 +1913,26 @@ def build_dollhouse_oneshot_prompt(
     removed_wall: str,
     blank_compass: Optional[List[str]] = None,
 ) -> str:
-    """Return the prompt for the cutaway that removes `removed_wall` ("north" or "south").
+    """Return the prompt for the cutaway that removes `removed_wall`.
 
-    Images must arrive in fixed compass order [floor, N, S, E, W].
-    blank_compass: list of compass walls that have no elevation and are visible in
-                   this view — model is told to render them as plain painted surfaces.
+    Images arrive in config-defined order: [floor, back, removed, right, left].
+    blank_compass: compass walls with no elevation — rendered as plain surfaces.
     """
-    base = _ONESHOT_REMOVE_SOUTH if removed_wall.lower() == "south" else _ONESHOT_REMOVE_NORTH
+    cfg = build_camera_view_config(removed_wall)
+    base = _build_oneshot_template(cfg)
 
-    if not blank_compass:
-        return base
+    parts = [base]
 
-    blank_lines = "\n".join(
-        f"- {c.upper()} wall: NO elevation provided — render as a plain painted surface. "
-        "Do NOT add any products, art, windows, or doors to this wall."
-        for c in blank_compass
-    )
-    return base + f"\n\nBLANK WALLS (no elevation image — plain surface only)\n{blank_lines}"
+    # Append blank wall warnings with camera-relative role context
+    if blank_compass:
+        blank_lines = []
+        for c in blank_compass:
+            role = cfg.role_for_compass(c) or "visible"
+            blank_lines.append(
+                f"- {c.upper()} wall (the {role.upper()} wall in this view): "
+                "NO elevation provided — render as a plain painted surface. "
+                "Do NOT add any products, art, windows, or doors to this wall."
+            )
+        parts.append("BLANK WALLS (no elevation image — plain surface only)\n" + "\n".join(blank_lines))
+
+    return "\n\n".join(parts)
