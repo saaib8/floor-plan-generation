@@ -12,10 +12,7 @@ SurfaceType = Literal["floor", "wall"]
 WALL_CATEGORIES: frozenset[str] = frozenset({
     "art-canvas",
     "decorative-hanger",
-    "outdoor-lighting",
-    "pendant-lighting",
     "shelve",
-    "storage_box",  # occasional DB typo variant
     "wall-clock",
     "wall-lighting",
 })
@@ -46,7 +43,6 @@ FLOOR_CATEGORIES: frozenset[str] = frozenset({
     "l-shape-sofa",
     "lampshade",
     "laundry-basket",
-    "lighting",
     "mattress-pad",
     "mattresses",
     "office-chair",
