@@ -49,6 +49,7 @@ class WallImageUrl(BaseModel):
 
 class ComposeRequest(BaseModel):
     floor_image_url: str               # server-relative path, e.g. "/outputs/xxx_isometric.png"
+    floor_image_url_back: Optional[str] = None  # back-view floor (rotated guide render); falls back to floor_image_url
     wall_image_urls: List[WallImageUrl]
     room_dimensions: Optional[Dict[str, Any]] = None
     presets: Optional[Dict[str, Any]] = None

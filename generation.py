@@ -1,4 +1,5 @@
 import base64
+import copy
 import logging
 import os
 import re
@@ -732,6 +733,53 @@ def _generate_isometric_with_validation(
     return best_iso, attempt_metrics
 
 
+_COMPASS_FLIP = {"north": "south", "south": "north", "east": "west", "west": "east"}
+
+
+def _mirror_payload_180(payload: dict) -> dict:
+    """Return a deep copy of the floor-plan payload with all product positions,
+    rotations, and opening positions mirrored 180° around the room centre.
+    Used to build the Floor B prompt so the text geometry matches the
+    180°-rotated guide image exactly — no contradictory signals.
+    """
+    mirrored = copy.deepcopy(payload)
+    room = mirrored.get("room", {})
+    room_w = float(room.get("width") or 0)
+    room_d = float(room.get("length") or 0)
+
+    # Mirror polygon room vertices if present
+    polygon = mirrored.get("room", {}).get("polygon")
+    if polygon and isinstance(polygon, list):
+        mirrored["room"]["polygon"] = [
+            [round(room_w - float(pt[0]), 3), round(room_d - float(pt[1]), 3)]
+            for pt in polygon if isinstance(pt, (list, tuple)) and len(pt) >= 2
+        ]
+
+    for product in mirrored.get("products", []):
+        pos = product.get("position", {})
+        if pos:
+            pos["x"] = round(room_w - float(pos.get("x") or 0), 3)
+            pos["y"] = round(room_d - float(pos.get("y") or 0), 3)
+        product["rotation_y"] = (float(product.get("rotation_y") or 0) + 180) % 360
+
+    for opening in mirrored.get("openings", []):
+        # Flip compass wall (supports both "wall" and "compass" field names)
+        wall = (opening.get("wall") or opening.get("compass") or "").lower()
+        flipped = _COMPASS_FLIP.get(wall, wall)
+        if "wall" in opening:
+            opening["wall"] = flipped
+        if "compass" in opening:
+            opening["compass"] = flipped
+
+        # Mirror position_from_left: new = wall_length - old_pos - opening_width
+        opening_w = float(opening.get("width") or opening.get("width_m") or 0)
+        pos_left = float(opening.get("position_from_left") or 0)
+        wall_len = room_w if wall in ("north", "south") else room_d
+        opening["position_from_left"] = round(max(0.0, wall_len - pos_left - opening_w), 3)
+
+    return mirrored
+
+
 def _generate_views_sequential(
     payload: dict,
     image_bytes_list: List[bytes],
@@ -740,7 +788,12 @@ def _generate_views_sequential(
     has_guide: bool = False,
     guide_bytes: Optional[bytes] = None,
 ) -> Tuple[Dict[str, bytes], List[Dict]]:
-    """Generate top-down (isometric) view only."""
+    """Generate two isometric floor renders: Floor A (standard) and Floor B (rotated guide).
+
+    Floor B is produced by rotating the guide image 180° and re-running the same edit call.
+    This gives the dollhouse compositor a perspective-matched floor reference for each
+    cutaway view (front uses Floor A, back uses Floor B).
+    """
     if guide_bytes is not None and VALIDATION_ENABLED:
         iso_bytes, attempt_metrics = _generate_isometric_with_validation(
             payload, image_bytes_list,
@@ -757,7 +810,27 @@ def _generate_views_sequential(
         iso_bytes = _openai_product_placement_edit(iso_prompt, image_bytes_list, size=size)
         attempt_metrics = []
 
-    return {"isometric": iso_bytes}, attempt_metrics
+    # Floor B: rotate guide 180° AND mirror product positions in the payload so the
+    # text geometry and visual guide are fully consistent (no contradictory signals).
+    iso_back_bytes: Optional[bytes] = None
+    if guide_bytes is not None:
+        try:
+            rotated_guide = pil_to_png_bytes(Image.open(BytesIO(guide_bytes)).rotate(180))
+            back_images = [rotated_guide] + image_bytes_list[1:]
+            mirrored_payload = _mirror_payload_180(payload)
+            back_prompt = build_floor_plan_prompt(
+                mirrored_payload, image_order=image_order, has_guide=has_guide, view="isometric"
+            )
+            logger.info("Generating back floor view: rotated guide + mirrored payload")
+            iso_back_bytes = _openai_product_placement_edit(back_prompt, back_images, size=size)
+        except Exception as exc:
+            logger.warning("Back floor render failed, falling back to front: %s", exc)
+            iso_back_bytes = iso_bytes
+
+    result: Dict[str, bytes] = {"isometric": iso_bytes}
+    if iso_back_bytes is not None:
+        result["isometric_back"] = iso_back_bytes
+    return result, attempt_metrics
 
 
 def _generate_wall_elevation_with_validation(
@@ -1422,6 +1495,7 @@ def generate_room_composition(
     presets: Optional[Dict] = None,
     openings: Optional[List[Dict]] = None,
     base_dir: Optional[str] = None,
+    floor_image_url_back: Optional[str] = None,
 ) -> Dict[str, bytes]:
     """Generate TWO opposite open-box (dollhouse) isometric room renders.
 
@@ -1433,7 +1507,10 @@ def generate_room_composition(
 
     Returns {"front": bytes, "back": bytes}.
 
-    floor_image_url: server-relative path like "/outputs/xxx_isometric.png"
+    floor_image_url:      server-relative path for the front-view floor render.
+    floor_image_url_back: optional server-relative path for the back-view floor render
+                          (generated from a 180°-rotated guide). Falls back to
+                          floor_image_url when not provided.
     wall_image_urls: list of {url, compass|label, wall_id, width_m, height_m}. Each wall
                      is placed by compass direction ("north"/"south"/"east"/"west"),
                      read from "compass" (preferred) or "label".
@@ -1454,6 +1531,11 @@ def generate_room_composition(
         raise FileNotFoundError(f"Image not found at local path: {path}")
 
     floor_bytes = _resolve(floor_image_url)
+    floor_bytes_back = _resolve(floor_image_url_back) if floor_image_url_back else floor_bytes
+    if floor_bytes_back is floor_bytes or floor_bytes_back == floor_bytes:
+        logger.warning("Composition: floor_bytes_back is identical to floor_bytes — both views use same floor render")
+    else:
+        logger.info("Composition: floor_bytes=%d bytes, floor_bytes_back=%d bytes (distinct)", len(floor_bytes), len(floor_bytes_back))
 
     # Build compass → bytes mapping from the provided wall elevation images.
     # Prefer the explicit "compass" field; fall back to "label" for compatibility.
@@ -1613,29 +1695,41 @@ def generate_room_composition(
         )
         return best_bytes
 
-    def _ordered_wall_images() -> List[bytes]:
-        # Fixed [NORTH, SOUTH, EAST, WEST] order so the Image→compass mapping in the single-shot
-        # prompt always holds. A wall with no elevation gets a plain wall-colour placeholder.
+    # Image slot order per view so both prompts share the same slot meaning:
+    #   slot 2 = back wall, slot 3 = removed wall, slot 4 = right wall, slot 5 = left wall
+    # Front (remove south): back=N, removed=S, right=E, left=W  → [N, S, E, W]
+    # Back  (remove north): back=S, removed=N, right=W, left=E  → [S, N, W, E]
+    _VIEW_IMAGE_ORDER = {
+        "south": ("north", "south", "east", "west"),
+        "north": ("south", "north", "west", "east"),
+    }
+
+    def _ordered_wall_images(removed_wall: str) -> tuple:
+        # Returns (images, blank_compass).
+        # Removed wall always gets a blank placeholder — sending its elevation lets
+        # the model migrate that content to a blank visible-wall slot.
         wall_color = (presets or {}).get("wall_color", "#F3EFE8")
         placeholder: Optional[bytes] = None
         out: List[bytes] = []
-        for c in ("north", "south", "east", "west"):
+        blank_compass: List[str] = []
+        for c in _VIEW_IMAGE_ORDER.get(removed_wall, ("north", "south", "east", "west")):
             b = wall_map.get(c)
-            if b is None:
+            if b is None or c == removed_wall:
                 if placeholder is None:
                     placeholder = _make_plain_wall(wall_color)
-                logger.info("Composition oneshot: %s wall has no elevation, using plain placeholder", c)
+                if c != removed_wall:
+                    logger.info("Composition oneshot: %s wall has no elevation, using plain placeholder", c)
+                    blank_compass.append(c)
                 b = placeholder
             out.append(b)
-        return out
+        return out, blank_compass
 
-    def _assemble_oneshot(removed_wall: str) -> bytes:
-        # Single call: floor (IMAGE 1) + the four wall elevations (IMAGE 2..5 = N, S, E, W) sent
-        # together, with the verbatim prompt that maps each image to its compass wall and removes
-        # the near wall. No shell/warp/per-wall edits — the model renders the cutaway in one pass.
-        prompt = build_dollhouse_oneshot_prompt(removed_wall)
-        images = [floor_bytes] + _ordered_wall_images()
-        logger.info("Composition oneshot: remove %s wall, single call with %d images", removed_wall, len(images))
+    def _assemble_oneshot(removed_wall: str, floor: bytes) -> bytes:
+        images_list, blank_compass = _ordered_wall_images(removed_wall)
+        prompt = build_dollhouse_oneshot_prompt(removed_wall, blank_compass=blank_compass or None)
+        images = [floor] + images_list
+        logger.info("Composition oneshot: remove %s wall, %d images, blank: %s",
+                    removed_wall, len(images), blank_compass or "none")
         return _compose_edit(prompt, images)
 
     # ── Compose the two opposite cutaway views. A GPT-4o vision QA gate keeps the best of several
@@ -1644,8 +1738,8 @@ def generate_room_composition(
         logger.info("Composition backend: ONESHOT (floor + four walls in a single call per view)")
         # "front" removes the SOUTH wall (camera outside south, North is the focal back wall);
         # "back" removes the NORTH wall (camera outside north). Together they reveal all walls.
-        front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_oneshot("south"), ["north", "east", "west"])
-        back_fn = lambda: _run_qa_loop("back", lambda n: _assemble_oneshot("north"), ["south", "east", "west"])
+        front_fn = lambda: _run_qa_loop("front", lambda n: _assemble_oneshot("south", floor_bytes), ["north", "east", "west"])
+        back_fn  = lambda: _run_qa_loop("back",  lambda n: _assemble_oneshot("north", floor_bytes_back), ["south", "east", "west"])
     elif COMPOSITION_BACKEND == "geometric":
         logger.info("Composition backend: GEOMETRIC (computed structure guide + guided photoreal fill)")
         front_designed = [c for c in dollhouse_view_walls("front")[1] if c in wall_map]

@@ -210,6 +210,7 @@ No sticker or cutout look. Colored guide marks must vanish -- show natural floor
 4. **No product substitution** -- every slot must show the product from its designated PRODUCT_IMAGE; do not replace with a generic alternative.
 5. **No text or graphics** overlaid on the render -- no dimension lines, labels, arrows, or watermarks.
 6. **Same framing as BASE** -- identical room footprint and layout, with a consistent top bird-eye 3D isometric camera angle.
+7. **Never alter product orientation** -- render every product at exactly the rotation_y stated in the data. Do NOT rotate, flip, or reorient any product even if a different angle looks more natural or correct to you. The stated rotation is authoritative.
 
 ## Data
 {json.dumps(batch_items, ensure_ascii=False, indent=2)}
@@ -1756,142 +1757,38 @@ watermarks, or overlays.
 
 
 # ── Single-shot dollhouse prompts ────────────────────────────────────────────
-# These are the exact prompts that work when ALL images (floor + the four walls) are sent in
-# ONE call with an explicit Image→compass mapping. Image order MUST be:
-#   IMAGE 1 = floor, IMAGE 2 = NORTH, IMAGE 3 = SOUTH, IMAGE 4 = EAST, IMAGE 5 = WEST.
-# Two opposite cutaway views: one removes the NORTH wall, one removes the SOUTH wall. The text
-# is kept verbatim — do not reword.
+# Images always arrive in fixed compass order:
+#   Image 1 = floor render, Image 2 = NORTH, Image 3 = SOUTH,
+#   Image 4 = EAST, Image 5 = WEST.
+# Two separate prompts map each compass wall to its on-screen position for
+# that specific camera angle.
 
-_ONESHOT_REMOVE_NORTH = """Create a photorealistic architectural dollhouse visualization from the provided floor plan and four wall images.
+_ONESHOT_REMOVE_SOUTH = """Create a photorealistic architectural dollhouse visualization from the provided isometric room render and four wall images.
 
 INPUT IMAGE MAPPING
 
-Image 1 = Floor plan (top-down layout, authoritative source for room geometry and furniture placement)
+Image 1 = Top-down isometric layout of the room — authoritative source for room geometry, furniture positions, footprints, spacing, and in-plan facing. It is NOT the final camera; the final three-quarter dollhouse camera is described below.
 
 Image 2 = North Wall
-Position: Top edge of floor plan
+Position: Far/back side of room
 
 Image 3 = South Wall
-Position: Bottom edge of floor plan
+Position: Near side — this wall is REMOVED (camera stands outside it)
 
 Image 4 = East Wall
-Position: Right edge of floor plan
+Position: Right edge of room
 
 Image 5 = West Wall
-Position: Left edge of floor plan
+Position: Left edge of room
 
 ROOM RECONSTRUCTION RULES
 
 North Wall = Image 2
 South Wall = Image 3
-East Wall = Image 4
-West Wall = Image 5
+East Wall  = Image 4
+West Wall  = Image 5
 
-The floor plan is the ground-truth source of:
-- room dimensions
-- wall positions
-- furniture locations
-- object orientations
-- spacing between products
-
-Wall images provide appearance, materials, colors, windows, doors, trims, and decorative details only.
-
-Do not:
-- swap wall locations
-- mirror walls
-- rotate walls
-- alter room proportions
-- move furniture
-- add products
-- remove products
-
-DOLLHOUSE CUTAWAY VIEW
-
-Camera Position:
-Outside the North Wall looking toward the South Wall.
-
-Remove the North Wall completely.
-
-Keep the South, East, and West walls fully visible and accurately textured.
-
-WALL PLACEMENT IN THIS VIEW (fixed by the camera — do not swap or mirror)
-
-Because the camera stands outside the North wall facing South, each wall occupies one fixed on-screen position. Render each wall's appearance from its own image onto exactly the position below:
-- SOUTH wall (Image 3) = the BACK wall: runs left-to-right across the far side of the room.
-- EAST wall (Image 4) = the LEFT-side wall: recedes from the front-left toward the back-left corner.
-- WEST wall (Image 5) = the RIGHT-side wall: recedes from the front-right toward the back-right corner.
-- NORTH wall (Image 2) = the removed/open side nearest the camera: do NOT draw it, and do NOT place its contents on any other wall.
-
-Never put one wall's contents on a different wall, and never swap the LEFT (East) and RIGHT (West) side walls.
-
-WALL FIDELITY
-
-Each wall image is the GROUND TRUTH for that wall. Render every wall exactly as its own image shows — do NOT generate, add, remove, change, resize, or relocate anything on a wall beyond what that wall's image already contains (this includes its art/canvas, doors, and windows).
-
-Camera Settings:
-- 35–45 degree viewing angle
-- slightly elevated perspective
-- wide architectural lens
-- entire room visible in one frame
-
-FURNITURE & WALL-ART FIDELITY
-
-The camera views the room from the North side, so each item is naturally seen from its opposite (north-facing) side. Show the correct visible side of each item — but the layout itself does not change:
-
-- Keep every furniture item in its EXACT floor plan location. Do not move, shift, slide, or reposition anything.
-- Do NOT rotate, spin, or re-orient furniture to face the camera. Preserve each item's true real-world orientation; only the viewing angle changes.
-- Do NOT reshape, rescale, restyle, or reconstruct any object.
-- Reproduce every wall-mounted item (framed art, canvas, mirror, shelf, sconce) EXACTLY as shown in its wall image — same artwork, same type, same count, same colors, same design. Never repaint, alter, or swap a canvas/artwork, and never turn it into a window or any other object.
-
-VISIBILITY REQUIREMENTS
-
-Every furniture item and product must remain visible.
-
-No furniture may be hidden behind walls.
-
-Preserve exact placement from the floor plan.
-
-Preserve exact scale relationships between all products.
-
-RENDER STYLE
-
-- ultra photorealistic
-- luxury interior visualization
-- realistic global illumination
-- ray-traced shadows
-- physically based materials (PBR)
-- furniture catalog quality
-- crisp details
-- clean neutral background
-- high-resolution architectural render"""
-
-
-_ONESHOT_REMOVE_SOUTH = """Create a photorealistic architectural dollhouse visualization from the provided floor plan and four wall images.
-
-INPUT IMAGE MAPPING
-
-Image 1 = Floor plan (top-down layout, authoritative source for room geometry and furniture placement)
-
-Image 2 = North Wall
-Position: Top edge of floor plan
-
-Image 3 = South Wall
-Position: Bottom edge of floor plan
-
-Image 4 = East Wall
-Position: Right edge of floor plan
-
-Image 5 = West Wall
-Position: Left edge of floor plan
-
-ROOM RECONSTRUCTION RULES
-
-North Wall = Image 2
-South Wall = Image 3
-East Wall = Image 4
-West Wall = Image 5
-
-The floor plan is the ground-truth source of:
+Image 1 (isometric render) is the ground-truth source of:
 - room dimensions
 - wall positions
 - furniture locations
@@ -1922,8 +1819,8 @@ WALL PLACEMENT IN THIS VIEW (fixed by the camera — do not swap or mirror)
 
 Because the camera stands outside the South wall facing North, each wall occupies one fixed on-screen position. Render each wall's appearance from its own image onto exactly the position below:
 - NORTH wall (Image 2) = the BACK wall: runs left-to-right across the far side of the room.
-- EAST wall (Image 4) = the RIGHT-side wall: recedes from the front-right toward the back-right corner.
-- WEST wall (Image 5) = the LEFT-side wall: recedes from the front-left toward the back-left corner.
+- EAST wall  (Image 4) = the RIGHT-side wall: recedes from the front-right toward the back-right corner.
+- WEST wall  (Image 5) = the LEFT-side wall: recedes from the front-left toward the back-left corner.
 - SOUTH wall (Image 3) = the removed/open side nearest the camera: do NOT draw it, and do NOT place its contents on any other wall.
 
 Never put one wall's contents on a different wall, and never swap the LEFT (West) and RIGHT (East) side walls.
@@ -1932,21 +1829,27 @@ WALL FIDELITY
 
 Each wall image is the GROUND TRUTH for that wall. Render every wall exactly as its own image shows — do NOT generate, add, remove, change, resize, or relocate anything on a wall beyond what that wall's image already contains (this includes its art/canvas, doors, and windows).
 
-Camera Settings:
+Camera settings:
 - 35–45 degree viewing angle
 - slightly elevated perspective
 - wide architectural lens
 - entire room visible in one frame
 
-VISIBILITY REQUIREMENTS
+FURNITURE & WALL-ART FIDELITY
 
-Every furniture item and product must remain visible.
+This render's camera looks into the room from the open South side (the three-quarter dollhouse view described above), so each item is seen from that angle. Use Image 1 only for layout — it is top-down — and keep that layout exactly:
 
-No furniture may be hidden behind walls.
+- Keep every furniture item in its EXACT location as shown in Image 1. Do not move, shift, slide, or reposition anything.
+- Do NOT rotate, spin, or re-orient furniture to face the camera. Preserve each item's true real-world orientation; only the viewing angle changes.
+- Do NOT reshape, rescale, restyle, or reconstruct any object.
+- Reproduce every wall-mounted item (framed art, canvas, mirror, shelf, sconce) EXACTLY as shown in its wall image — same artwork, same type, same count, same colors, same design. Never repaint, alter, or swap a canvas/artwork, and never turn it into a window or any other object.
 
-Preserve exact placement from the floor plan.
+PLACEMENT & VISIBILITY REQUIREMENTS
 
-Preserve exact scale relationships between all products.
+Preserve exact furniture placement and scale from Image 1. No furniture may be relocated, resized, or duplicated.
+Render each item only as it is genuinely seen from this angle: an item may be partially or fully occluded by OTHER FURNITURE in front of it — that is natural and correct. Do NOT move, shrink, duplicate, or re-arrange items to force every piece into view.
+No furniture may be hidden behind a WALL — the near wall is open/removed in the dollhouse view, so nothing should be blocked by a wall.
+Keep the whole room and its overall layout in frame; do not crop away large parts of the room.
 
 RENDER STYLE
 
@@ -1961,8 +1864,125 @@ RENDER STYLE
 - high-resolution architectural render"""
 
 
-def build_dollhouse_oneshot_prompt(removed_wall: str) -> str:
-    """Return the verbatim single-shot dollhouse prompt for the cutaway that removes
-    `removed_wall` ("north" or "south"). Images must be sent in the fixed order
-    [floor, north, south, east, west] so the Image→compass mapping in the text holds."""
-    return _ONESHOT_REMOVE_SOUTH if removed_wall.lower() == "south" else _ONESHOT_REMOVE_NORTH
+_ONESHOT_REMOVE_NORTH = """Create a photorealistic architectural dollhouse visualization from the provided isometric room render and four wall images.
+
+INPUT IMAGE MAPPING
+
+Image 1 = Top-down isometric layout of the room — authoritative source for room geometry, furniture positions, footprints, spacing, and in-plan facing. It is NOT the final camera; the final three-quarter dollhouse camera is described below.
+
+Image 2 = South Wall
+Position: Far/back side of room
+
+Image 3 = North Wall
+Position: Near side — this wall is REMOVED (camera stands outside it)
+
+Image 4 = West Wall
+Position: Right edge of room
+
+Image 5 = East Wall
+Position: Left edge of room
+
+ROOM RECONSTRUCTION RULES
+
+South Wall = Image 2
+North Wall = Image 3
+West Wall  = Image 4
+East Wall  = Image 5
+
+Image 1 (isometric render) is the ground-truth source of:
+- room dimensions
+- wall positions
+- furniture locations
+- object orientations
+- spacing between products
+
+Wall images provide appearance, materials, colors, windows, doors, trims, and decorative details only.
+
+Do not:
+- swap wall locations
+- mirror walls
+- rotate walls
+- alter room proportions
+- move furniture
+- add products
+- remove products
+
+DOLLHOUSE CUTAWAY VIEW
+
+Camera:
+Build the three-quarter dollhouse view (see Camera settings below) from Image 1's layout. Keep the SAME orientation as Image 1 — do NOT orbit, rotate, flip, or mirror relative to it, and do NOT re-arrange its furniture: the wall at the BACK of Image 1 stays the back wall, the LEFT side stays the left wall, the RIGHT side stays the right wall, and the NEAR/front side is the open (removed) side.
+
+Cutaway:
+Remove the near/open wall at the FRONT of Image 1 (its elevation is Image 3) — do NOT draw it, and do NOT place its contents on any other wall.
+Keep the far/back wall and both side walls fully visible and accurately textured.
+
+WALL PLACEMENT IN THIS VIEW (fixed by Image 1's geometry — do not swap or mirror)
+
+Each wall occupies one fixed on-screen position, matching Image 1's geometry exactly. Render each wall's appearance from its own image onto exactly the position below:
+- BACK wall (far side, runs left-to-right across the back of the room) = Image 2 (South Wall).
+- RIGHT-side wall (recedes from the front-right toward the back-right corner) = Image 4 (West Wall).
+- LEFT-side wall (recedes from the front-left toward the back-left corner) = Image 5 (East Wall).
+- NEAR/open wall (the removed front side) = Image 3 (North Wall): do NOT draw it, and do NOT place its contents on any other wall.
+
+Never put one wall's contents on a different wall, and never swap the LEFT and RIGHT side walls.
+
+WALL FIDELITY
+
+Each wall image is the GROUND TRUTH for that wall. Render every wall exactly as its own image shows — do NOT generate, add, remove, change, resize, or relocate anything on a wall beyond what that wall's image already contains (this includes its art/canvas, doors, and windows).
+
+Camera settings:
+- 35–45 degree viewing angle
+- slightly elevated perspective
+- wide architectural lens
+- entire room visible in one frame
+
+FURNITURE & WALL-ART FIDELITY
+
+This render's camera looks into the room from the open near side (the three-quarter dollhouse view described above). Use Image 1 only for layout — it is top-down — and keep that layout exactly:
+
+- Keep every furniture item in its EXACT location as shown in Image 1. Do not move, shift, slide, or reposition anything.
+- Do NOT rotate, spin, mirror, or re-orient furniture. Reproduce each item exactly as it appears in Image 1 — same position, same orientation, same visible side.
+- Do NOT reshape, rescale, restyle, or reconstruct any object.
+- Reproduce every wall-mounted item (framed art, canvas, mirror, shelf, sconce) EXACTLY as shown in its wall image — same artwork, same type, same count, same colors, same design. Never repaint, alter, or swap a canvas/artwork, and never turn it into a window or any other object.
+
+PLACEMENT & VISIBILITY REQUIREMENTS
+
+Preserve exact furniture placement and scale from Image 1. No furniture may be relocated, resized, or duplicated.
+Render each item only as it is genuinely seen from this angle: an item may be partially or fully occluded by OTHER FURNITURE in front of it — that is natural and correct. Do NOT move, shrink, duplicate, or re-arrange items to force every piece into view.
+No furniture may be hidden behind a WALL — the near wall is open/removed in the dollhouse view, so nothing should be blocked by a wall.
+Keep the whole room and its overall layout in frame; do not crop away large parts of the room.
+
+RENDER STYLE
+
+- ultra photorealistic
+- luxury interior visualization
+- realistic global illumination
+- ray-traced shadows
+- physically based materials (PBR)
+- furniture catalog quality
+- crisp details
+- clean neutral background
+- high-resolution architectural render"""
+
+
+def build_dollhouse_oneshot_prompt(
+    removed_wall: str,
+    blank_compass: Optional[List[str]] = None,
+) -> str:
+    """Return the prompt for the cutaway that removes `removed_wall` ("north" or "south").
+
+    Images must arrive in fixed compass order [floor, N, S, E, W].
+    blank_compass: list of compass walls that have no elevation and are visible in
+                   this view — model is told to render them as plain painted surfaces.
+    """
+    base = _ONESHOT_REMOVE_SOUTH if removed_wall.lower() == "south" else _ONESHOT_REMOVE_NORTH
+
+    if not blank_compass:
+        return base
+
+    blank_lines = "\n".join(
+        f"- {c.upper()} wall: NO elevation provided — render as a plain painted surface. "
+        "Do NOT add any products, art, windows, or doors to this wall."
+        for c in blank_compass
+    )
+    return base + f"\n\nBLANK WALLS (no elevation image — plain surface only)\n{blank_lines}"

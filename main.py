@@ -399,6 +399,7 @@ def _run_composition(gen_id: str, payload: dict):
     try:
         results = generate_room_composition(
             floor_image_url=payload["floor_image_url"],
+            floor_image_url_back=payload.get("floor_image_url_back"),
             wall_image_urls=[dict(wi) for wi in payload["wall_image_urls"]],
             room_dimensions=payload.get("room_dimensions"),
             presets=payload.get("presets"),

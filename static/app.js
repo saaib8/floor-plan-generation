@@ -1800,17 +1800,28 @@ function opDisplayFrac(op) {
 function wallToCompass(wall) {
   const dx = wall.x2 - wall.x1;
   const dy = wall.y2 - wall.y1;
-  const isHorizontal = Math.abs(dx) >= Math.abs(dy);
-  const xs = S.drawPoints.map(p => p.x);
-  const ys = S.drawPoints.map(p => p.y);
-  const centerY = (Math.min(...ys) + Math.max(...ys)) / 2;
-  const centerX = (Math.min(...xs) + Math.max(...xs)) / 2;
-  const midY = (wall.y1 + wall.y2) / 2;
   const midX = (wall.x1 + wall.x2) / 2;
-  if (isHorizontal) {
-    return midY < centerY ? 'north' : 'south';
+  const midY = (wall.y1 + wall.y2) / 2;
+
+  // Polygon centroid — stable reference point for any room shape
+  const n = S.drawPoints.length || 1;
+  const centerX = S.drawPoints.reduce((s, p) => s + p.x, 0) / n;
+  const centerY = S.drawPoints.reduce((s, p) => s + p.y, 0) / n;
+
+  // Outward normal: perpendicular to the wall, pointing AWAY from the room centroid.
+  // Two candidates: (-dy, dx) and (dy, -dx). Pick the one whose dot product with
+  // the (midpoint → centroid) vector is negative (i.e. points away from centroid).
+  const toCx = centerX - midX;
+  const toCy = centerY - midY;
+  const dot = (-dy) * toCx + dx * toCy;  // dot of candidate (-dy,dx) with toCenter
+  const nx = dot < 0 ? -dy : dy;
+  const ny = dot < 0 ?  dx : -dx;
+
+  // Classify dominant outward direction (screen coords: Y increases downward = south)
+  if (Math.abs(nx) >= Math.abs(ny)) {
+    return nx < 0 ? 'west' : 'east';
   } else {
-    return midX < centerX ? 'west' : 'east';
+    return ny < 0 ? 'north' : 'south';
   }
 }
 
@@ -2274,10 +2285,11 @@ async function pollGeneration(genId, surfaceKey) {
 }
 
 const VIEW_LABELS = {
-  isometric: 'Top View', elevation: 'Wall Elevation',
+  isometric: 'Floor View (Front)', isometric_back: 'Floor View (Back)',
+  elevation: 'Wall Elevation',
   composition_front: 'Room View', composition_back: 'Opposite View',
 };
-const VIEW_ORDER  = ['isometric', 'elevation'];
+const VIEW_ORDER  = ['isometric', 'isometric_back', 'elevation'];
 const COMPOSITE_ORDER = ['composition_front', 'composition_back'];
 
 // Lightbox: clicking a result image opens it full-screen
@@ -2693,6 +2705,7 @@ if (btnCompose) {
     const floorImgs = S.generatedImages['floor'];
     const floorUrl = floorImgs ? (floorImgs.isometric || Object.values(floorImgs)[0]) : null;
     if (!floorUrl) { setStatus('Generate the floor first', 'error'); return; }
+    const floorUrlBack = floorImgs?.isometric_back || floorUrl;
 
     const wallImageUrls = [];
     for (const [key, imgs] of Object.entries(S.generatedImages)) {
@@ -2751,7 +2764,7 @@ if (btnCompose) {
       const res = await fetch('/api/compose', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ floor_image_url: floorUrl, wall_image_urls: wallImageUrls, room_dimensions: roomDimensions, presets: {}, openings: composeOpenings }),
+        body: JSON.stringify({ floor_image_url: floorUrl, floor_image_url_back: floorUrlBack, wall_image_urls: wallImageUrls, room_dimensions: roomDimensions, presets: {}, openings: composeOpenings }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
