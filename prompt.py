@@ -1,6 +1,9 @@
 import json
+import logging
 import re
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from models import CameraViewConfig, WallSlot
 
@@ -1057,9 +1060,47 @@ def build_floor_plan_prompt(
             f"The floor plan guide (IMAGE 1) shows the polygon outline — match it precisely."
         )
 
-    return "\n\n".join(filter(None, [appearance, view_line, room_shape_block, rotation_block, refs, identity_block, geometry_block, spatial_spec, correction_notes, openings_spec, constraints])).strip() + (
-        "\n\nOutput: one photorealistic render, no overlays, no on-image text."
-    )
+    _PROMPT_CHAR_LIMIT = 32000
+    _SUFFIX = "\n\nOutput: one photorealistic render, no overlays, no on-image text."
+
+    # Assemble the prompt, trimming redundant sections if it exceeds the API limit.
+    # Priority order for trimming (least critical first):
+    #   1. spatial_spec — wall-gap distances; guide already shows positions visually
+    #   2. identity_block — staging-prop warnings; constraints already cover this
+    #   3. rotation_block — English rotation summaries; JSON geometry has facing info
+    sections = [appearance, view_line, room_shape_block, rotation_block, refs,
+                identity_block, geometry_block, spatial_spec, correction_notes,
+                openings_spec, constraints]
+    prompt = "\n\n".join(filter(None, sections)).strip() + _SUFFIX
+
+    if len(prompt) > _PROMPT_CHAR_LIMIT:
+        logger.warning("Floor prompt %d chars exceeds %d limit, trimming spatial_spec",
+                       len(prompt), _PROMPT_CHAR_LIMIT)
+        spatial_spec = ""
+        sections = [appearance, view_line, room_shape_block, rotation_block, refs,
+                    identity_block, geometry_block, spatial_spec, correction_notes,
+                    openings_spec, constraints]
+        prompt = "\n\n".join(filter(None, sections)).strip() + _SUFFIX
+
+    if len(prompt) > _PROMPT_CHAR_LIMIT:
+        logger.warning("Floor prompt still %d chars, trimming identity_block",
+                       len(prompt))
+        identity_block = ""
+        sections = [appearance, view_line, room_shape_block, rotation_block, refs,
+                    identity_block, geometry_block, spatial_spec, correction_notes,
+                    openings_spec, constraints]
+        prompt = "\n\n".join(filter(None, sections)).strip() + _SUFFIX
+
+    if len(prompt) > _PROMPT_CHAR_LIMIT:
+        logger.warning("Floor prompt still %d chars, trimming rotation_block",
+                       len(prompt))
+        rotation_block = ""
+        sections = [appearance, view_line, room_shape_block, rotation_block, refs,
+                    identity_block, geometry_block, spatial_spec, correction_notes,
+                    openings_spec, constraints]
+        prompt = "\n\n".join(filter(None, sections)).strip() + _SUFFIX
+
+    return prompt
 
 
 def build_wall_plan_prompt(
