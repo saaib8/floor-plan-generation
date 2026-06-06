@@ -240,12 +240,14 @@ def get_product_icon(product_id: int):
 
 @app.post("/api/generate", response_model=GenerationStartResponse)
 async def start_generation(request: GenerationRequest):
-    if not request.products:
+    if request.type not in ("floor", "wall"):
+        raise HTTPException(status_code=400, detail="type must be 'floor' or 'wall'")
+    # A wall may be generated with no products (opening-only or fully bare) so that every
+    # wall produces an elevation for composition. Floor still requires at least one product.
+    if not request.products and request.type != "wall":
         raise HTTPException(status_code=400, detail="products list is empty")
     if len(request.products) > 20:
         raise HTTPException(status_code=400, detail="Maximum 20 products allowed")
-    if request.type not in ("floor", "wall"):
-        raise HTTPException(status_code=400, detail="type must be 'floor' or 'wall'")
 
     gen_id = str(uuid.uuid4())
 

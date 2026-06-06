@@ -1528,7 +1528,12 @@ function updateGenerateBtn() {
   const allHaveUrls = S.placedProducts.every(pp => pp.imageUrl.trim());
   const key = currentSurfaceKey();
   const surfaceBusy = isSurfaceGenerating(key);
-  btnGenerate.disabled = !hasProducts || !allHaveUrls || surfaceBusy;
+  // Walls may be generated even with no products — a wall with only a door/window opening,
+  // or a completely bare wall — so every wall yields an elevation for composition.
+  // Floor still requires at least one product.
+  const isWall = !!S.selectedSurface && S.selectedSurface.type === 'wall';
+  const canGenerate = !!S.selectedSurface && (hasProducts || isWall) && allHaveUrls;
+  btnGenerate.disabled = !canGenerate || surfaceBusy;
   const labelSpan = btnGenerate.querySelector('span');
   const labelText = surfaceBusy ? 'Generating…' : 'Generate';
   if (labelSpan && labelSpan.nextSibling) {
@@ -2156,7 +2161,9 @@ function exportHighlightImage() {
 // ── Generate ───────────────────────────────────────────────────
 btnGenerate.addEventListener('click', async () => {
   const surfaceKey = currentSurfaceKey();
-  if (!surfaceKey || S.placedProducts.length === 0 || !S.selectedSurface) return;
+  if (!surfaceKey || !S.selectedSurface) return;
+  // Floor needs ≥1 product; a wall can generate bare (opening-only or fully blank).
+  if (S.selectedSurface.type !== 'wall' && S.placedProducts.length === 0) return;
   if (isSurfaceGenerating(surfaceKey)) return;
 
   saveSurfaceLayout();

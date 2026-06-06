@@ -813,17 +813,36 @@ def _generate_views_sequential(
 
     # Floor B: rotate guide 180° AND mirror product positions in the payload so the
     # text geometry and visual guide are fully consistent (no contradictory signals).
+    # Floor B feeds the BACK composite view, so it runs through the SAME spatial-validation
+    # gate as Floor A — validated against its own rotated guide + mirrored payload.
     iso_back_bytes: Optional[bytes] = None
     if guide_bytes is not None:
         try:
             rotated_guide = pil_to_png_bytes(Image.open(BytesIO(guide_bytes)).rotate(180))
             back_images = [rotated_guide] + image_bytes_list[1:]
             mirrored_payload = _mirror_payload_180(payload)
-            back_prompt = build_floor_plan_prompt(
-                mirrored_payload, image_order=image_order, has_guide=has_guide, view="isometric"
-            )
-            logger.info("Generating back floor view: rotated guide + mirrored payload")
-            iso_back_bytes = _openai_product_placement_edit(back_prompt, back_images, size=size)
+            if VALIDATION_ENABLED:
+                logger.info("Generating back floor view (validated): rotated guide + mirrored payload")
+                iso_back_bytes, back_attempt_metrics = _generate_isometric_with_validation(
+                    mirrored_payload, back_images,
+                    guide_bytes=rotated_guide,
+                    size=size,
+                    image_order=image_order,
+                    has_guide=has_guide,
+                )
+                if back_attempt_metrics:
+                    final = back_attempt_metrics[-1]
+                    logger.info(
+                        "Back floor validation: %d attempt(s), final score=%.3f passed=%s",
+                        len(back_attempt_metrics),
+                        final.get("best_score", 0), final.get("passed", False),
+                    )
+            else:
+                back_prompt = build_floor_plan_prompt(
+                    mirrored_payload, image_order=image_order, has_guide=has_guide, view="isometric"
+                )
+                logger.info("Generating back floor view (no validation): rotated guide + mirrored payload")
+                iso_back_bytes = _openai_product_placement_edit(back_prompt, back_images, size=size)
         except Exception as exc:
             logger.warning("Back floor render failed, falling back to front: %s", exc)
             iso_back_bytes = iso_bytes
@@ -1424,7 +1443,7 @@ def generate_product_placement(
     Floor: views = {"isometric"}  (top view only)
     Wall:  views = {"elevation"}
     """
-    if not products:
+    if not products and generation_type != "wall":
         raise ValueError("products list is empty.")
 
     # Normalize products
@@ -1473,7 +1492,9 @@ def generate_product_placement(
     for p in cleaned_products:
         image_bytes_list.append(_sanitize_image_bytes(download_bytes(p["image_url"])))
 
-    if VALIDATION_ENABLED:
+    # A bare wall (opening-only or fully blank) has no products for the QA gate to score,
+    # so skip the validation retry loop and render it in a single pass.
+    if VALIDATION_ENABLED and cleaned_products:
         elevation_bytes, attempt_metrics = _generate_wall_elevation_with_validation(
             wall_payload, image_bytes_list,
             guide_bytes=guide_bytes,

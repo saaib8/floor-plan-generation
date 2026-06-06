@@ -859,15 +859,19 @@ def build_floor_plan_prompt(
             "PRODUCT IDENTITY FIDELITY — EQUALLY IMPORTANT AS PLACEMENT ACCURACY:"
         )
         identity_lines.append(
-            "IMPORTANT: Reference photos may contain OTHER objects (chairs at desks, pillows on beds, "
-            "rugs under tables, plants, accessories). These are staging props — IGNORE THEM. "
-            "From each reference photo, extract and render ONLY the single named product below."
+            "IMPORTANT: Reference photos may stage SEPARATE items AROUND the product (a chair beside a desk, "
+            "a nightstand beside a bed, a rug under a table, plants, lamps, wall art). IGNORE those separate items. "
+            "BUT you MUST keep the soft furnishings that are PART OF the product itself and rest ON it — the sheets, "
+            "comforter/duvet, and pillows ON a bed; the seat cushions, back cushions, and throw pillows ON a sofa or "
+            "armchair. Render each product FULLY DRESSED exactly as its photo shows, only without the separate "
+            "surrounding items."
         )
         for i, pid in enumerate(img_order, start=1):
             identity_lines.append(
-                f"  IMAGE {i + 1} → render ONLY the \"{pid}\" — copy its exact design, shape, color, "
-                f"material, frame, and structure. IGNORE any other furniture, chairs, accessories, "
-                f"or objects visible in the same photo — they are staging props, not products to render."
+                f"  IMAGE {i + 1} → render the \"{pid}\" FULLY DRESSED — copy its exact design, shape, color, "
+                f"material, frame, structure, AND the soft furnishings resting on it (bedding & pillows on a bed, "
+                f"cushions & throw pillows on a sofa). IGNORE only SEPARATE pieces staged beside or under it "
+                f"(other chairs, side tables, rugs, plants, lamps)."
             )
         # Detect duplicates — same base product used multiple times
         base_names = {}
@@ -884,8 +888,8 @@ def build_floor_plan_prompt(
 
         identity_lines.append(
             "\nIDENTITY RULES:\n"
-            "- From each reference photo, render ONLY the single named product. All other objects in the photo are staging — discard them.\n"
-            "- If a desk photo shows a chair, render ONLY the desk. If a bed photo shows side tables, render ONLY the bed.\n"
+            "- Render the named product FULLY DRESSED as shown, including the soft furnishings ON it (a bed's sheets, comforter, and pillows; a sofa's seat/back cushions and throw pillows). Do NOT strip them off.\n"
+            "- Discard only SEPARATE pieces staged beside or under it: if a desk photo shows a chair, render only the desk; if a bed photo shows a side table, render the bed WITH its bedding but not the side table.\n"
             "- Do NOT change the fabric color, pattern, or material of the named product.\n"
             "- Do NOT redesign the product shape, frame, or structure — copy the named product faithfully.\n"
             "- Do NOT add extra hardware (handles, locks, knobs) to doors or furniture beyond what the reference shows.\n"
@@ -1025,8 +1029,10 @@ def build_floor_plan_prompt(
     n_openings = len(openings)
     constraints = (
         f"HARD CONSTRAINTS — every rule is mandatory, violation = failure:\n"
-        f"(1) Exactly {n} furniture item(s) in total — no more, no fewer. Do NOT add chairs, stools, rugs, lamps, plants, "
-        f"cushions, throws, blankets, or any object from a reference photo's background/staging.\n"
+        f"(1) Exactly {n} furniture item(s) in total — no more, no fewer. Do NOT add SEPARATE objects from a reference "
+        f"photo's staging (extra chairs, stools, side tables, rugs, lamps, plants). This does NOT mean stripping a "
+        f"product's own dressing: a bed keeps its sheets/comforter/pillows and a sofa keeps its cushions/throw pillows — "
+        f"those are part of the single item, not extra items.\n"
     )
     if n_openings:
         constraints += (
@@ -1851,6 +1857,13 @@ def _build_oneshot_template(cfg: CameraViewConfig) -> str:
 
     return f"""Create a photorealistic architectural dollhouse visualization from the provided isometric room render and four wall images.
 
+CRITICAL STRUCTURE RULE — EXACTLY THREE WALLS (read first; this is the most common failure)
+This is an open-box cutaway with EXACTLY ONE wall removed and THREE walls KEPT. Do NOT produce the common two-wall "corner" dollhouse.
+- KEEP three solid, full-height, opaque walls, all fully visible in the final image: the BACK wall ({B.compass.title()}), the LEFT wall ({L.compass.title()}), and the RIGHT wall ({R.compass.title()}).
+- REMOVE exactly one wall — only the NEAR/front wall ({REM.compass.title()}). No other wall may be removed, opened, shortened, faded, or left out.
+- The room is a closed three-wall "U" seen from the open front: the back wall sits far/centre, one side wall closes the LEFT edge of the floor, one side wall closes the RIGHT edge of the floor. Both side walls meet the back wall at a vertical corner and run down to the floor along its left and right edges.
+- If the result shows only two walls (an L-shaped corner), it is WRONG. Three walls must stand; exactly one (the near/front) is open.
+
 INPUT IMAGE MAPPING
 
 Image 1 = Top-down isometric layout of the room — authoritative source for room geometry, furniture positions, footprints, spacing, and in-plan facing. It is NOT the final camera; the final three-quarter dollhouse camera is described below.
@@ -1891,8 +1904,8 @@ Camera:
 Build the three-quarter dollhouse view (see Camera settings below) from Image 1's layout. Keep the SAME orientation as Image 1 — do NOT orbit, rotate, flip, or mirror relative to it, and do NOT re-arrange its furniture: the wall at the BACK of Image 1 stays the back wall, the LEFT side stays the left wall, the RIGHT side stays the right wall, and the NEAR/front side is the open (removed) side.
 
 Cutaway:
-Remove the near/open wall at the FRONT of Image 1 (its elevation is Image {REM.image_slot}) — do NOT draw it, and do NOT place its contents on any other wall.
-Keep the far/back wall and both side walls fully visible and accurately textured.
+Remove EXACTLY ONE wall — the near/open wall at the FRONT of Image 1 (its elevation is Image {REM.image_slot}) — do NOT draw it, and do NOT place its contents on any other wall.
+KEEP all THREE other walls — the far/back wall AND both side walls (left and right) — solid, opaque, full-height, and fully visible. Both side walls are mandatory; neither the left nor the right wall may be omitted, opened, or left as empty space. Do not stop at a two-wall corner.
 
 WALL PLACEMENT IN THIS VIEW (fixed by Image 1's geometry — do not swap or mirror)
 
